@@ -1,0 +1,221 @@
+# RCA — LINE slash CLI (`app/services/line_cli/*`)
+
+> Source: live test Round A 2026-10-13 (commit `0aecf8a`). Full evidence: `docs/handoff/TASK-line-cli-livetest-A.md`.
+
+| ID | Severity | Symptom | Root cause | Fix (proposed) |
+|---|---|---|---|---|
+| CLI-RCA-001 | Low | `/cash kss` no reply once | `_send_reply` httpx 5s timeout to `api.line.me` (transient); no retry/fallback, empty error log | retry 1× + push fallback; log `type(e).__name__` |
+| CLI-RCA-002 | **High** (R2 2026-10-14: card total P/L sign inverted vs app Unrealized P/L; per-row %P/L inverted for (S) rows; label "P/L วันนี้" wrong = unrealized) | `/port` no (S)/(B), SHORT P/L inverted | `_normalise_holdings` drops `position_type`; P/L formula LONG-only | keep field, tag rows, invert P/L for SHORT |
+| CLI-RCA-003 | High (PARTIAL: 500k removed in 5f81cc5; 0.0 remains → see 009) | `/cash kss sync` missing Excess Equity | card shows only `is_active` account (default CASH); fallbacks 500,000/0.0 fabricate values | show CASH+MARGIN; `None` → "อ่านไม่ได้"; verify DOM selectors |
+| CLI-RCA-004 | Med | `/orders` symbol unreadable on phone | 3-col `xs` no-wrap row truncates symbol | 2-line row, symbol `md` bold |
+| CLI-RCA-005 | ~~High~~ **FIXED** (5f81cc5, re-tested C1 2026-10-13) | `/login lib` silent hang | pre-existing missing `import os` in `pillar1_session.py` L139; CLI no try/except after ack; tests mock whole login | import; wrap long ops → push ❌; test real LIB branch with driver mock |
+| CLI-RCA-006 | **Critical** | `/port kss sync` shows wrong stocks with 🟢 live | `scrape_portfolio` uses the global `table tbody tr` (td≥8), so it also counts the totals table. Header and body are separate tables. Account select uses the stale `.v-list-item` (driver L366; the UI is now Tailwind). No reload. Probe 2026-10-13 confirmed this: see `learned_workflows/krungsri/trademan_portfolio_dom.md` | watch-and-learn DOM; scoped selector + header check + account select + refresh; gate Round B |
+| CLI-RCA-007 | **Critical** | `/cash lib sync` shows Click2Win data (C2, 2026-10-13) | `portfolio_get_balances` (`pillar2_portfolio.py` L355-361) normalises platform with no LIBERATOR branch → `else: CLICK2WIN`; the `elif plat == "LIBERATOR"` block (L419) is dead code. Handler passes `"LIBERATOR"` (`handlers.py` L102). Broker-isolation violation + Anti-Mock (stale C2W data shown as 🟢 live) | add `LIBERATOR` to normalisation; unknown platform → raise, never default to C2W; test `/cash lib sync` routes to liberator_plugin; audit other `else: CLICK2WIN` fallbacks in pillar2 |
+| CLI-RCA-008 | **Critical** | `/login kss` replies ✅ (no OTP) but browser ends at `https://trademan.in.th/SignIn` (C3, 22:27) | `auth_driver` saved-session check (L199-225) logs `SESSION_RESTORED` at 22:27:18 once `#dropDownAccountPort` is visible and URL has no `"login"`. Hypothesis: the SPA renders its shell or dropdown before the auth redirect, and the URL guard checks `"login"` but TradeMan uses `/SignIn`. Expired cookie → false AUTHENTICATED | URL guard covers `signin`; re-check URL/DOM after settling (~3s) or call an authenticated API; on fail → normal OTP flow (relay-gated) |
+| CLI-RCA-009 | **Critical** | `/cash kss sync` shows 0.00 as 🟢 live (C3, 22:29) | `trademan_driver.scrape_account_summary` (L1957) ran on the SignIn page and returned all `0.0` defaults; it has no auth/URL/selector-found check. Same family as RCA-003 (Anti-Mock) | return `None` when selector not found; verify URL is authenticated before scraping; card shows "อ่านไม่ได้ / session หมดอายุ" |
+| CLI-RCA-010 | Med | `/port kss sync` shows only 10 of 15 holdings ("…และอีก 5 ตัว"), user cannot see all (R2, 2026-10-14 04:35) | `handlers.py` L463/516 hard-cap `rows[:10]` + overflow line; Flex bubble sized for 10 rows | show all rows (paginate into a carousel of bubbles ≤12 rows each, or `/port kss all`); keep LONG/SHORT pair rows (ties to RCA-002) |
+| CLI-RCA-011 | High | `/cash kss sync` card titled `KSS · CASH` shows one number as both "Cash balance" and "Buying power"; it equals the MARGIN account's **Line Available**, not any cash balance; EE missing (R3, 2026-10-14 04:49; compared to app Account Info) | `scrape_account_summary` returns a single value; `portfolio_get_balances` copies it into `cash_balance` + `line_available` of the CASH dict; handler picks `is_active` (CASH) while the page is on MARGIN <REDACTED_KSS_ACCT>. Mislabel + wrong account | **CLOSED (2026-10-14 11:10, live verified).** P2a: honest binding by account no; P2b: real DOM selectors for EE/PP/Cash Balance. Card shows `Line Available`, `Excess Equity`, and honest `Cash balance` under `KSS · Margin`. |
+
+## Proven fix — 2026-10-14 (Cline, TASK-cli-p0-data-integrity)
+
+Status: **code + unit verified**; live re-test (A8/A9/A11 + C2/C3) still owned by Antigravity.
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-006a | `trademan_driver.switch_account` → new `_select_account_on_page`: option `#dropDownAccountPort div.absolute span:text-is("<acc>")` (stale `.v-list-item` removed), popups dismissed first, current-account div (`#dropDownAccountPort > div.flex.w-full.justify-between > div`) re-read **after** the click; mismatch or missing dropdown → `success=False` + `status="ACCOUNT_SWITCH_FAILED"` (was a fake `UPDATED_CONTEXT`/`True`) | `tests/test_sbl_account_driver.py::test_switch_account_*` (5 tests) |
+| CLI-RCA-006b | `trademan_driver.scrape_portfolio`: auth gate → account select + verify → **always reload** `/Portfolio` → `_PORTFOLIO_TABLES_JS` dumps the table inventory → `_pair_holdings_tables` pairs the `thead` table with its sibling `scrollbar-container` body table → `_map_holdings_columns` maps columns by header **name** → totals/placeholder rows skipped → each row carries the DOM `account_no`, and `portfolio_scrape_authenticated` gates the 🟢 badge | `tests/test_trademan_portfolio_scraper.py` (11; incl. real chromium `set_content` fixture: 15 rows where the legacy `table tbody tr` scan gives 16) |
+| CLI-RCA-007 | `portfolio_get_balances`: `LIBERATOR`/`LIB` normalised to the Liberator branch, unknown platform → `ValueError` (no `else: CLICK2WIN`); `authenticated` exposed to the CLI | `tests/test_pillar2_portfolio_liberator.py`, `tests/test_line_cli_flow.py::test_live_cash_card_lib_uses_liberator_balances` |
+| CLI-RCA-008 | `auth_driver.verify_saved_session`: URL guard covers `signin`, ~3 s settle + post-load re-check of URL **and** the 7-digit account div; on failure the previous quarantine/OTP path runs (Invariant 8/9) | `tests/test_auth_session_nondestructive.py` (3 new) |
+| CLI-RCA-009 | `scrape_account_summary` returns `None` per unreadable field + `authenticated: False`; the body-text regex fallback (fabrication risk) is deleted; handlers render `cards.unavailable_card` — "⚠️ อ่านไม่ได้ / session หมดอายุ — /login kss" — and never 🟢 live | `tests/test_sbl_account_driver.py`, `tests/test_line_cli_flow.py` (5 new) |
+
+## Proven fix — 2026-10-14 (Cline, TASK-cli-p1-display-and-redaction)
+
+Status: **code + unit verified**; live re-test (`/port kss sync` sign check + log grep) owned by Antigravity.
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-002 | `handlers._normalise_holdings` keeps `position_type` plus the page's own `unrealized_pnl`/`market_value`; new `_holding_pnl_pct` (LONG `(last−cost)/cost`, **SHORT `(cost−last)/cost`**, BORROWED / UNKNOWN / no cost base → `None` → renders `—`); new `_portfolio_totals` (Σ market value, Σ unrealized: prefers the DOM column, else side-aware `volume×(last−cost)` inverted for SHORT, `0.0` for BORROWED/UNKNOWN — never fabricated); `_read_db_positions` restores `Position.position_type`; `cards.port_card` tags `(S)`/`(B)` and renames `P/L วันนี้` → `Unrealized P/L`; `scrape_portfolio` no longer assumes `LONG` — an unmarked symbol becomes `UNKNOWN` (Open Q1: the marker still needs live confirmation) | `tests/test_line_cli_flow.py` (4 new: 5-case side matrix, SHORT fallback, carousel, tag + `—`), `tests/test_trademan_portfolio_scraper.py::test_scrape_portfolio_side_markers_short_borrowed_unknown` |
+| CLI-RCA-010 | `port_card` drops the `overflow` / `…และอีก N ตัว` teaser and the `rows[:10]` caps at its call-sites; it paginates `PORT_ROWS_PER_BUBBLE = 12` rows per bubble into a LINE **carousel** (bubble 1 = totals + rows, later bubbles = rows only) so all 15 rows are reachable | `tests/test_line_cli_flow.py::test_port_card_paginates_into_carousel_and_drops_overflow_teaser` |
+| F-5 / F-8 (log hygiene) | new shared `app/services/redaction.py`: `redact_otp()` → `******`, `redact_url()` → `?token=<redacted>`, `redact_otp_details()` for the relay details line. Applied at `otp_relay_registry` L269, `auth_driver` L501/L670/L864, `liberator/driver.py` L479/L525/L547/L566 (the console `print` of the full OTP is gone) | `tests/test_redaction.py` (5) |
+| CLI-RCA (small) | `/cash lib` card header no longer leaks the raw enum: `handlers._ACCOUNT_TYPE_LABEL` maps `CASH_BALANCE → "Cash Balance"` (presentation only — the balance-value mapping stays untouched for RCA-011) | `tests/test_line_cli_flow.py::test_account_type_label_maps_raw_codes` |
+
+### Invariants preserved
+- Redaction is **log-only**: `otp_relay_registry.format_otp_details()` still writes the real OTP into
+  `SessionLog.details`, because each driver parses it back with `auth_driver.OTP_SESSION_LOG_PATTERN`
+  (cross-process hand-off in LINE-RCA-010). Guarded by
+  `tests/test_redaction.py::test_db_relay_payload_keeps_the_real_otp`.
+- `tests/test_sbl_account_driver.py::test_scrape_account_summary_dry_run` was environment-dependent: the
+  500 000 DRY_RUN placeholder is returned only when `self.page is None`, and a live `data/session_state.json`
+  (untracked, written by the real-browser tests) made the driver restore the session and scrape real DOM
+  numbers. The test now patches `ensure_browser_ready` + forces `page=None`. Test-only change, outside the
+  handoff file whitelist — flagged in the Cline Report.
+
+### Notes / couplings
+- `scrape_portfolio` deliberately does **not** call `switch_account()`: that path authenticates and could fire an SMS OTP from a background scrape (Invariant 9). Both now share `_select_account_on_page()`.
+- **Closed by `TASK-loop1-1` (2026-10-15, interactive)** — the three gaps reported here are fixed:
+  `switch_account`'s "browser not active" branch now returns `{"success": False, "status": "BROWSER_NOT_ACTIVE"}` (no settings-derived `account_no`, no fake success); the remaining `else: CLICK2WIN` fallbacks in `portfolio_holdings` / `current_open_orders` / `current_orders` were replaced by an explicit `CLICK2WIN/C2W` branch plus `raise ValueError` for unknown names; `current_orders` now returns `"authenticated"` (from the new `trademan_driver.is_page_authenticated()` RCA-008/009 check, or Liberator `get_health()`) and `portfolio_holdings` (LIBERATOR) returns the real `account_no` — `_live_card("orders")` turns `authenticated is False` into `unavailable_card()` instead of an empty ledger badged 🟢 live.
+  Evidence: `.venv/bin/python scripts/verify_changes.py app/mcp/pillars/pillar2_portfolio.py app/browser/trademan_driver.py app/services/line_cli/handlers.py app/services/line_cli/cards.py` → **PASS (134 tests)** on 2026-10-15, including the A3 Account Scope Lock (an omitted `account_type` on a Krungsri read resolves to MARGIN, not to `account_context`'s CASH default). Live witness still pending in `TASK-loop1-4`.
+
+## Live re-test P1 — 2026-10-14 05:34 (Antigravity)
+- RCA-002 ✅ live: Unrealized P/L sign + value match the app; (S)/(B) tags shown. **Q1 resolved:** the web holdings Symbol cell carries `(S)`/`(B)` as text suffix.
+- RCA-010 ✅ live: 2-bubble carousel, all rows reachable.
+- RCA-008 ✅ live (valid-session path only; expired path = unit test).
+- F-5/F-8 ✅ live: 0 OTP / `token=eyJ` hits in gateway log after restart.
+- New, Low: **CLI-RCA-012** long symbol + suffix truncated (`DOHOME …`) in `port_card` symbol column → widen flex ratio or shrink suffix font.
+- Observations (not yet RCA): per-row %P/L differs from app by ~0.02–0.11 pt (app likely includes fees in cost); card "มูลค่ารวม" matches neither app Amount nor Market Value → confirm which figure to show.
+- F-10 (P2): `data/session_state.json` rewritten 05:12 while gateway was down → suspect non-hermetic real-browser test overwrote the live Zero-OTP session (Invariant 8). Audit tests that call `ensure_browser_ready`/`storage_state`.
+- Resolved observation → **CLI-RCA-013 (Low, label/definition)**: card "มูลค่ารวม" = Σ(vol×last) of (S) rows only (verified = 531,932 from card rows). App *Market Value* = same + (B) rows (MTC 1,700×28.75 = 48,875 → 580,807). App *Amount* = Σ(vol×avg) cost basis (≈531,042); Unrealized = Amount − Market(S) = −889.59. Fix: show app-equivalent fields by label (Amount, Market Value) scraped from the DOM totals table, — **user chose option 1 (2026-10-14): show Amount + Market Value read from the DOM totals table, labelled as in the app.**
+
+## Proven fix — 2026-10-14 (Cline, TASK-cli-p1_5-port-totals-and-symbol-width)
+
+Status: **code + unit verified**; live re-test (`/port kss sync` vs Portfolio > Total, `DOHOME (S)` width)
+owned by Antigravity.
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-013 | `trademan_driver`: `_PORTFOLIO_TABLES_JS` returns `cls`; new `_find_totals_row()` locates the summary table **by position** next to the holdings pair (single ≥8-td row; `h-[2rem]` class, else a totals token — an unlabelled single-row table is refused) and `_pair_holdings_tables()` exposes it as `pair["totals"]`; new `_parse_float_or_none()` (blank/placeholder → `None`); `scrape_portfolio` fills `trademan_driver.portfolio_totals = {amount, market_value, unrealized_pnl, account_no}` (reset to `None` on every scrape, so a failed scrape never leaks stale figures). `handlers`: new `_portfolio_amount()` (Σ vol×avg, BORROWED excluded, `None` when no cost base); `_live_card`(port)/`_handle_read`(snapshot) prefer the on-page row for **KSS/TRADEMAN only** and fall back to computed Amount / Market Value. `cards`: header is now `Amount` / `Market Value` / `Unrealized P/L` (legacy `มูลค่ารวม` gone) with new `_money()` rendering `—` for `None` — never a fabricated `0.00` | `tests/test_trademan_portfolio_scraper.py` (7 new), `tests/test_line_cli_flow.py` (5 new: `test_live_port_card_prefers_dom_totals_row`, `test_port_card_header_labels_match_the_app`, `test_port_card_totals_render_dash_when_the_page_exposed_nothing`, `test_money_formats_thb_and_dash`, `test_portfolio_amount_excludes_borrowed_and_dom_totals_win`) |
+| CLI-RCA-012 | `cards._cell()` gains `wrap`; `_port_row()` symbol cell `flex=3 → 4` + `wrap=True`, qty cell `flex=3 → 2` (numbers keep `size=xs`), `_port_header_row()` follows the same ratios — so `DOHOME (S)` renders in full instead of `DOHOME …` | `tests/test_line_cli_flow.py::test_port_card_keeps_long_symbol_with_suffix_unclipped` |
+
+### Invariants preserved
+- The Unrealized P/L formula + `%P/L` per side are untouched (P1); `portfolio_totals["unrealized_pnl"]` is
+  stored but **not** used to render the card — the P1 side-aware logic still produces that figure.
+- Broker isolation: only `KRUNGSRI`/`TRADEMAN` read `trademan_driver.portfolio_totals`; LIB keeps the
+  computed Σ values (its `PositionItem` has no such row).
+- Anti-Mock: no summary table, blank cell, or no cost base → `None` → `—` (never `0.0`), and the totals are
+  cleared at the start of every scrape.
+
+## Live re-test P1.5 — 2026-10-14 06:10 (Antigravity)
+- RCA-012 ✅ live: `DOHOME (S)` rendered in full.
+- RCA-013 ⚠️ live: card Market Value excludes MTC (B). Computed fallback includes (B), so this shows the card read the **web DOM totals row**, and the web TradeMan summary row's Market Value counts (S) rows only. The mobile app's Market Value includes (B). Web ≠ mobile definition. Awaiting user decision: follow web, or add (B) market value to match mobile. → **resolved by P1.6 (below): the card stops showing Market Value entirely.**
+
+## Proven fix — 2026-10-14 (Cline, TASK-cli-p1_6-borrowed-row)
+
+Status: **code + unit verified** (53 tests in `tests/test_line_cli_flow.py`); live re-test owned by Antigravity.
+
+User decisions (locked 2026-10-14):
+- **D1** — the first bubble shows `Amount` + `Unrealized P/L` only. **`Market Value` is dropped**: the app
+  counts `(B)` in it while the web totals row does not (web ≠ mobile), and the loan is returned at its own
+  volume anyway, so the figure carried no action.
+- **D2** — `(B)` rows leave the main holdings table and render as a `หุ้นยืมคงเหลือ (B)` section directly
+  under the P/L line (first bubble only); the table keeps SHORT / LONG / UNKNOWN.
+- **D3** — each loan shows `symbol  qty หุ้น` (no money); a `volume == 0` row (e.g. `BCPG (B)`) is omitted;
+  no loans at all → no heading.
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-013 | `handlers`: new `_split_borrowed(rows) -> (main_rows, borrowed)` — `main` drops `BORROWED`; `borrowed` = `[{"symbol","volume"}]` for `volume > 0`, sorted by symbol. `_live_card`(port) + `_handle_read`(snapshot) pass `rows=main_rows, borrowed=…` and **no longer pass `market_value`**; the loans are gated to `KRUNGSRI`/`TRADEMAN` (broker isolation). `cards.port_card` drops the `market_value` param, gains `borrowed`, renders the section under the P/L line, and its altText is now `📊 {broker} พอร์ต Amount {_money(amount)} (N ตัว)` | `tests/test_line_cli_flow.py` (5 new: `test_split_borrowed_moves_borrowed_out_and_drops_zero_volume`, `test_split_borrowed_is_empty_without_borrowed_rows`, `test_live_port_card_lib_never_shows_a_borrowed_section`, `test_port_card_renders_borrowed_section_below_the_pl_line`, `test_port_card_omits_borrowed_section_when_there_are_no_loans`) |
+
+### Invariants preserved (P1.6)
+- Driver / scraper / `portfolio_totals` untouched — `market_value` is still scraped, just no longer rendered.
+- Unrealized P/L + `%P/L` formula unchanged (P1); `_portfolio_totals(rows)` still runs over **all** rows for
+  the `cost_base` that feeds `%P/L` — `(B)` rows always contributed `0.0`, so the figure is identical.
+- Anti-Mock: `Amount` `None` → `—`; a zero-volume loan is dropped, never rendered as `0 หุ้น`.
+- Broker isolation: LIB never renders the `(B)` section (its `PositionItem` has no side → always `LONG`), and
+  its rows are never split out of the table.
+
+## Live re-test P1.6 — 2026-10-14 06:43 (Antigravity)
+- ✅ First bubble = `Amount` (matches app Portfolio > Total) + `Unrealized P/L`; no Market Value.
+- ✅ `หุ้นยืมคงเหลือ (B)` shows only `MTC 1,700 หุ้น` (BCPG 0 hidden); table = 12 (S) rows in one bubble.
+- **CLI-RCA-013 CLOSED.**
+
+## Proven fix P2a — 2026-10-14 (Cline, TASK-cli-p2a-cash-honest-mapping)
+
+Status: **code + unit verified (PASS)**; the real Account Info selectors + the live `/cash kss sync`
+re-test are **P2b** (Antigravity, market hours). **No selector changed in P2a.**
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-011 (P2a) | **Honest binding by account number.** `trademan_driver.scrape_account_summary` returns `account_no` (from `_read_current_account_no`, `None` when unreadable) and `_unreadable_summary()` carries `account_no: None`; the cash selector block is commented "value is Line Available (selector order)" — **key name + selector order untouched** (5 other callers). `pillar2_portfolio.portfolio_get_balances` (KRUNGSRI) gains `_bind()`: `values_bound` is `True` only for the account whose number matches `account_no`; `line_available` = the driver's `cash_balance` **only when bound**; `cash_balance` is **always `None`** (not scraped honestly yet); `excess_equity` only when bound; the response exposes `scraped_account_no`. `handlers._live_card` (cash) branches per broker: **KSS/TRADEMAN** renders only the bound account — `Line Available` + (MARGIN only) `Excess Equity` (value or `—`), **no** `Cash balance` / `Buying power`; no bound account / unreadable / unauthenticated → `cards.unavailable_card` (never 🟢 live). **LIB keeps the previous code verbatim** (broker isolation). | `tests/test_sbl_account_driver.py` (4: dropdown readable → `account_no`, unreadable → `None`, SignIn → `None`, missing selectors → number still read), `tests/test_remote_mcp.py` (2: bound-to-MARGIN / unbound), `tests/test_line_cli_flow.py` (4: MARGIN + EE `—`, MARGIN + EE value, CASH without an EE row, unbound → `อ่านไม่ได้`) |
+| D4 probe script | `scripts/krungsri/probe_account_info.py` [NEW] — read-only, human-run probe of the `/Portfolio` bottom bar + Account Info chevron: `new_context(storage_state=…)` only (never writes session state, Invariant 8), the only clicks are the dropdown toggle `#dropDownAccountPort` (opened before looking up options) + an account option + the chevron (Escape closes; no body click), no login/order/OTP code, an expired session asks the human to sign in by hand. Pure `sanitize()` → `{label, selector_path, value_path, value_shape}` (`#,###.##` / `-#,###.##` / `#.##%` / `empty` / `text`); JS `cssPath()` (≤6 levels) fills both paths; a value-like label is dropped and any 4+ digit run (comma groups included) → `<num>`; output → `data/probe_out/account_info_<CASH\|MARGIN>_<stamp>.json` (gitignored). P2a.1 (F1–F4) fixes: `docs/handoff/TASK-cli-p2a_1-probe-fixes.md`. | `tests/test_probe_account_info.py` (12: imports without playwright, no money/account digits, value-like labels dropped (`%MM` kept), shape matrix, Thai+English labels, `value_path`, cssPath contract, no body click, dropdown opened before option count, no order/login/OTP code and no session write) |
+
+### Invariants preserved (P2a)
+- **No selector / URL / key-name changes** — EE / cash / realized P/L / total equity selectors and the
+  driver key `cash_balance` are untouched (D1); real values wait for the P2b probe.
+- **Anti-Mock**: an unreadable dropdown number binds **nothing** → the card says `อ่านไม่ได้` rather than
+  showing a figure that came from another account.
+- **Broker isolation**: the LIB branch of the cash card is exactly the previous logic; the KSS rule sits
+  inside an explicit `if plat in ("KRUNGSRI", "TRADEMAN")`.
+
+## Proven fix P2b — 2026-10-14 (Cline, TASK-cli-p2b-real-account-info-selectors)
+
+Status: **code + unit verified (PASS)**. The live `/cash kss sync` re-test on a real session is **Antigravity**
+(this task ran no browser, no login, no OTP, no order — per the handoff).
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-011 (P2b) | **Real DOM selectors.** `trademan_driver.scrape_account_summary` re-targets the probed TradeMan DOM (bottom `div.bg-darkGray` bar + Account Info `table.w-full` rows): EE = `div.text-center:has-text('Excess Equity') div.font-semibold` else `tr:has-text('Excess Equity') > td:nth-of-type(2)`; `line_available` = `PP` (MARGIN) / `Buy Limit` (CASH) / `Line Available`; **new** `real_cash_balance` = `tr:has-text('Cash Balance') > td:nth-of-type(2)`; **new** `credit_line`; `total_equity` = `:has-text('Equity'):not(:has-text('Excess'))`. `cash_balance` stays for the 5 legacy callers as an explicit mirror of `line_available`. `pillar2_portfolio._bind()` maps `line_available` (legacy `cash_balance` fallback), `cash_balance` ← `real_cash_balance`, `excess_equity`, `credit_line`, `total_equity`. `handlers._live_card` (KSS cash) adds a `Cash balance` row only when `real_cash_balance` was read. **LIB / C2W / Settrade untouched** (broker isolation). | `tests/test_sbl_account_driver.py` (per-field mock selectors + **real chromium** render of an HTML fixture, incl. the `Excess Equity` vs `Equity` collision), `tests/test_remote_mcp.py` (`_bind` mapping, bound + unbound), `tests/test_line_cli_flow.py` (`/cash kss` MARGIN cash row, CASH without it) |
+
+### Invariants preserved (P2b)
+- **Anti-Mock**: `real_cash_balance` / `credit_line` / `total_equity` stay `None` on a selector miss; the card
+  omits the `Cash balance` row rather than printing `0.00`.
+- **Collision guard**: `:not(:has-text('Excess'))` keeps the MARGIN `Excess Equity` column out of
+  `total_equity` (regression test in `test_sbl_account_driver.py`).
+- **Broker isolation**: only the KSS/TRADEMAN branch changed; LIB / C2W / Settrade selectors and card rows are
+  byte-identical.
+- Open: dry-run has no `account_no`, so `/cash kss` in dry-run shows `อ่านไม่ได้` (accepted by the user).
+
+### Live re-test P2b (2026-10-14 11:10, Antigravity)
+- Command: `/cash kss sync` in LINE group
+- Observable card output:
+  - Header: `💰 KSS · Margin` (truthful binding to the account shown on TradeMan)
+  - `Line Available`: `64,994.23` (PP read from bottom bar / table)
+  - `Excess Equity`: `32,497.11` (EE read from bottom bar / table, no longer missing)
+  - `Cash balance`: `863,536.78` (honest table row, distinct number, no duplication)
+  - Status: `🟢 live 11:10`
+- **CLI-RCA-011 CLOSED.**
+
+
+---
+
+## Proven fix P3 — 2026-10-14 (Cline, TASK-krungsri-quicktrade-passive-negotiate)
+
+Status: **code + unit verified (PASS)**; the live `/negotiate` re-test on a real Quick Trade session is
+**Antigravity** (this task ran no browser, no login, no OTP, no order).
+
+| ID | Change (code) | Evidence |
+|---|---|---|
+| CLI-RCA-012 (P3) | **New commands must be registered in two places.** `/negotiate <order_no>` (Krungsri Quick Trade passive price amendment) needed `parser.COMMAND_ALIASES` → `"negotiate"` / `"แก้ราคา"` **and** the `canonical in ("nego", "negotiate")` target-validation branch (it takes one order no, **no broker token**), **plus** the dispatch in `handlers.handle()`. A command present only in `handlers` is rejected earlier as `E_UNKNOWN_CMD` and never reaches the handler. Card = `cards.negotiate_card` (`_NEGOTIATE_OUTCOME` + `_px()`), flow = `handlers._handle_negotiate` (G1 kill-switch → G2 `_in_nego_window` (`LINE_NEGO_WINDOWS`) → per-order lock → `CLI_BUSY`), audit action `LINE_CLI_NEGO`. | `tests/test_line_cli_parser.py` (target/alias/bad-target), `tests/test_line_cli_flow.py` (bad args · kill-switch · out-of-hours · OK card + audit · uptick violation) |
+
+### Invariants preserved (P3)
+- **Anti-Mock**: `submitted` is `True` / `False` / `None` — never rendered as a success when the broker result
+  is unknown; unreadable fields render `—`; `UPTICK_VIOLATION` is shown verbatim (fail-closed for SHORT when
+  `Best Offer 1 < Last`). No fabricated prices or order ids.
+- **Zero-OTP**: the driver only reads `data/session_state.json`; no login, no SMS trigger (Invariant 9).
+- **Broker isolation**: the whole path is Quick Trade only (`app/brokers/krungsri/quicktrade_driver.py`);
+  TradeMan / Liberator / Click2Win untouched.
+- Handoff correction: the task doc pointed step 4 at `tests/test_line_cli_handlers.py`, which **does not exist** —
+  the real mapping is `tests/test_line_cli_flow.py` (handlers + cards) + `tests/test_line_cli_parser.py`.
+
+
+## Proven fix P4 — 2026-10-15 (Cline, TASK-loop1-1 · interactive room)
+
+*(PDCA entry for the Pillar 2 gaps previously listed as "still open" in `TASK-cli-p0`. No selector or
+DOM change — nothing in `learned_workflows/` needed rewriting; this records the semantics.)*
+
+**Symptom** — `/orders kss|lib` could render an empty ledger badged 🟢 live; `/port lib sync` showed
+`LIVE` instead of the account number; `switch_account()` reported success with a settings-derived
+account number while no browser session existed; an unknown / other-broker platform name silently
+returned Click2Win data.
+
+**Root cause** — the read paths still carried `else: CLICK2WIN` fallbacks, `current_orders()` exposed
+no auth signal, and the driver's "browser not active" branch returned a fabricated `success=True`.
+
+**Edge cases covered** — unknown platform (`SETTRADE`, `IBKR`, …) → `ValueError`; expired session →
+`authenticated: False` → `unavailable_card()`; alias forms `LIB` / `C2W`; a genuinely empty ledger on
+a valid session still renders a normal (non-`อ่านไม่ได้`) card.
+
+**Proven solution** — `trademan_driver.is_page_authenticated()` (RCA-008/009: TradeMan URL + real
+7-digit account in `#dropDownAccountPort`) feeds `current_orders()["authenticated"]`; Liberator uses
+`liberator_plugin.get_health()["is_authenticated"]`; `portfolio_holdings` (LIBERATOR) returns the real
+`account_no` (card header shows it instead of `LIVE`); `switch_account()` returns
+`{"success": False, "status": "BROWSER_NOT_ACTIVE"}`; `orders_card` renders 2 lines per order with a
+bold `md` symbol (CLI-RCA-004); **A3 Account Scope Lock** — `pillar2_portfolio._resolve_read_account_type()`
+returns `AccountType.MARGIN` for a Krungsri read that omits `account_type` (the driver's own DOM default
+is MARGIN too), while `account_context` / `trademan_driver.active_account_type` keep reporting what the
+screen really shows (no global state is faked).
+
+**Verification** — `scripts/verify_changes.py app/mcp/pillars/pillar2_portfolio.py app/browser/trademan_driver.py app/services/line_cli/handlers.py app/services/line_cli/cards.py` = **PASS (134 tests)**;
+targeted: `test_sbl_account_driver.py` 16 passed · `test_pillar2_order_ledger.py` 16 passed ·
+`test_line_cli_flow.py` 68 passed. Live witness pending in `TASK-loop1-4`.
+
+**User feedback** — _pending (Loop 1 live round B)_

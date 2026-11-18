@@ -1,0 +1,4 @@
+# Optional local redaction rules (regex=replacement) for scripts/dev/sanitize_mirror.py.
+# Copy to .mirror-redact (gitignored) and add any hardcoded account numbers or IDs not in .env.
+# Example:
+# \b30249\d{2}\b=<REDACTED_KSS_ACCT>

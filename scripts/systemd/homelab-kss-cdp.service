@@ -1,0 +1,19 @@
+[Unit]
+Description=Investment Homelab Krungsri Chrome CDP Daemon (:9333 — Streaming & SBL Realtime, Resume-Only)
+After=network-online.target graphical-session.target homelab-gateway.service
+Wants=network-online.target homelab-gateway.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+UnsetEnvironment=LINE_ADMIN_USER_ID
+ExecStart=/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/.venv/bin/python scripts/broker_cdp/session_daemon.py kss 180 --resume-only
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+StandardOutput=append:/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/data/logs/daemon-kss.log
+StandardError=append:/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/data/logs/daemon-kss.log
+# On-demand only (started via --with-cdp or LINE /login); intentionally no [Install] so it never auto-starts on boot.

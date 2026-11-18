@@ -1,0 +1,55 @@
+# --- Secrets / credentials (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Runtime data: broker sessions, screenshots, DBs, caches ---
+# `data/*` (not `data/`) so the hand-authored JS snippet library stays versioned:
+# scripts/broker_cdp/js_runner.py loads these at runtime and they ARE source code.
+data/*
+!data/bookmarklets/
+!data/bookmarklets/**
+recordedVideo/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*session_state*.json*
+*storage_state*.json
+*.har
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# --- Node / tooling ---
+node_modules/
+
+# --- OS / editor ---
+.DS_Store
+*.swp
+*~
+.obsidian/
+*.canvas
+graphify-out/
+*.db.bak*
+.agents/teamwork/
+.mirror-redact

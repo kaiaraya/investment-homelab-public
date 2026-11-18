@@ -1,0 +1,2297 @@
+"""
+End-to-end tests for the LINE slash-command CLI (TASK-line-cli).
+
+Drives the real handler entrypoint ``app.services.line_cli.handlers.handle`` with
+a fake messaging service (captures replies/pushes) and mocked broker edges, so
+every assertion is against real handler logic — not a stub. Broker calls are
+mocked at the ``line_cli.handlers`` boundary (``_broker_*``), which is exactly
+where Broker Isolation lives.
+"""
+
+import json
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.core.config import settings
+from app.services.line_cli import handlers
+from app.services.line_cli import parser as cli_parser
+
+
+@pytest.fixture(autouse=True)
+def _enable_legacy_line_chat(monkeypatch):
+    monkeypatch.setattr(settings, "LINE_CHAT_COMMANDS_ENABLED", True)
+    monkeypatch.setattr(settings, "LINE_PUSH_MODE", "all")
+
+#: The autouse `_broker_edges` fixture stubs ``handlers._live_card`` — keep a real
+#: reference so the card-content tests below exercise the actual builder.
+REAL_LIVE_CARD = handlers._live_card
+
+#: Same idea for the two broker edges that the routing tests must exercise themselves.
+REAL_BROKER_OPEN_ORDERS = handlers._broker_open_orders
+REAL_BROKER_MODIFY = handlers._broker_modify
+
+#: The autouse `_broker_edges` fixture stubs the CDP attach helper — keep the real one
+#: so the CDP-3 unit tests below can drive it directly.
+REAL_ATTACH_SESSION_CDP = handlers._attach_session_cdp
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures / helpers
+# --------------------------------------------------------------------------- #
+class FakeService:
+    """Captures what the handlers would send to LINE."""
+
+    def __init__(self):
+        self.replies = []
+        self.pushes = []
+
+    async def _send_reply(self, reply_token, message_or_text):
+        self.replies.append(message_or_text)
+
+    async def push_message(self, message_or_text, to_user_id=None):
+        self.pushes.append((message_or_text, to_user_id))
+        return True
+
+    # convenience
+    def last_text(self):
+        return _text_of(self.replies[-1]) if self.replies else ""
+
+
+def _text_of(msg):
+    if isinstance(msg, str):
+        return msg
+    return msg.get("text") or msg.get("altText") or ""
+
+
+def _event(*, user_id="U_OP", source_type="user", group_id=None, reply_token="tok-cli"):
+    src = {"type": source_type}
+    if user_id:
+        src["userId"] = user_id
+    if group_id:
+        src["groupId"] = group_id
+    return {"source": src, "replyToken": reply_token}
+
+
+@pytest.fixture
+def service():
+    return FakeService()
+
+
+@pytest.fixture(autouse=True)
+def _broker_edges(monkeypatch):
+    """Default (happy, TEST-mode) broker edges — individual tests override as needed."""
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value={
+        "symbol": "PTT", "bid_1": 34.20, "offer_1": 34.30, "last": 34.00, "source": "test",
+    }))
+    monkeypatch.setattr(handlers, "_broker_modify", AsyncMock(return_value={"success": True}))
+    monkeypatch.setattr(handlers, "_broker_health", AsyncMock(return_value={
+        "authenticated": True, "heartbeat": "10:41", "account": "MARGIN",
+    }))
+    monkeypatch.setattr(handlers, "_live_card", AsyncMock(return_value={"type": "flex", "altText": "live"}))
+    monkeypatch.setattr(handlers, "_broker_sync_cdp", AsyncMock(return_value=None))
+    # CDP attach/detach is stubbed so no test ever touches a real daemon on 9333/9334.
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(return_value=None))
+    monkeypatch.setattr(handlers, "_detach_session_cdp", AsyncMock(return_value=False))
+    monkeypatch.setattr(handlers, "_in_nego_window", lambda now=None: True)
+    handlers._LOCKS.clear()
+    handlers._STARTED.clear()
+
+
+async def _run(service, text, *, db, **ev):
+    parsed = cli_parser.parse(text)
+    return await handlers.handle(parsed, db=db, raw_event=_event(**ev), service=service)
+
+
+# --------------------------------------------------------------------------- #
+# /help /status / authorization
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_help_lists_commands(service, db_session):
+    res = await _run(service, "/help", db=db_session)
+    assert res["status"] == "CLI_HELP"
+    text = service.last_text()
+    assert "คำสั่ง Homelab" in text
+    # 16 active commands verified in help text
+    active_commands = [
+        "/status", "/port", "/cash", "/orders", "/nego", "/cancel",
+        "/sbl", "/borrow", "/return",
+        "/buy", "/sell", "/short", "/cover",
+        "/size", "/halt", "/help"
+    ]
+    for cmd in active_commands:
+        assert cmd in text, f"Missing {cmd} in _HELP_TEXT"
+
+    # Emergency halt warning
+    assert "ยกเลิกทุกออเดอร์" in text
+
+    # Retired / legacy commands omitted from help
+    assert "/login" not in text
+    assert "/logout" not in text
+    assert "/negotiate" not in text
+    assert "/quicktrade" not in text
+
+    # Verify documented invocations parse without CliError
+    from app.services.line_cli.parser import parse, CliError
+    documented_invocations = [
+        "/help", "/help nego", "/help size",
+        "/status", "/status kss", "/status lib", "/status all",
+        "/port", "/port kss", "/port lib", "/port all",
+        "/cash", "/cash kss", "/cash lib", "/cash all",
+        "/orders", "/orders kss", "/orders lib", "/orders all",
+        "/cancel 04050", "/cancel 04050 kss", "/cancel 04050 lib",
+        "/nego kss", "/nego lib", "/nego all",
+        "/nego kss PTT", "/nego lib PTT", "/nego all PTT",
+        "/sbl", "/sbl sync", "/sbl pool PTT",
+        "/borrow PTT 1000",
+        "/return PTT", "/return PTT 1000", "/return PTT all",
+        "/buy PTT 100", "/buy PTT 100 34.5",
+        "/sell PTT 100", "/sell PTT 100 35.0",
+        "/short PTT 100", "/short PTT 100 34.0",
+        "/cover PTT 100", "/cover PTT 100 33.5",
+        "/size PTT", "/calc PTT",
+        "/halt",
+    ]
+    for inv in documented_invocations:
+        p = parse(inv)
+        assert not isinstance(p, CliError), f"Documented invocation '{inv}' failed to parse: {p}"
+
+    # Regression: verify /nego requires broker
+    err = parse("/nego")
+    assert isinstance(err, CliError) and err.code == "E_BROKER_REQUIRED"
+    err_sym = parse("/nego PTT")
+    assert isinstance(err_sym, CliError) and err_sym.code == "E_BROKER_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_help_subtopics(service, db_session):
+    """Verify subtopic help routing for /help nego, size, sbl, trade, cancel, port."""
+    for subcmd, expected in [
+        ("/help nego", "ต่อราคาออเดอร์ค้าง"),
+        ("/help size", "คำนวณจำนวนหุ้นงบ"),
+        ("/help sbl", "ระบบยืมและคืนหุ้น SBL"),
+        ("/help trade", "ส่งคำสั่งซื้อขายหุ้น"),
+        ("/help cancel", "ยกเลิกออเดอร์ที่ยังค้างในตลาด"),
+        ("/help port", "ดูพอร์ตหุ้นและผลกำไรขาดทุนสด"),
+    ]:
+        res = await _run(service, subcmd, db=db_session)
+        assert res["status"] == "CLI_HELP"
+        text = service.last_text()
+        assert expected in text, f"Expected '{expected}' in output of '{subcmd}', got: {text[:100]}"
+
+
+def test_command_aliases_all_covered():
+    from app.services.line_cli.parser import COMMAND_ALIASES
+    active_canonical = {
+        "help", "status", "stop", "port", "cash", "orders", "nego", "schedule", "cancel",
+        "buy", "sell", "short", "cover",
+        "sbl", "borrow", "return", "size", "halt"
+    }
+    for alias, canonical in COMMAND_ALIASES.items():
+        if canonical in ("login", "logout", "negotiate", "quicktrade"):
+            continue
+        assert canonical in active_canonical, f"Unknown canonical {canonical} for alias {alias}"
+
+
+@pytest.mark.asyncio
+async def test_status_card_reflects_kill_and_relay(service, db_session, monkeypatch):
+    from app.services.otp_relay_readiness import OtpRelayReadiness
+    from app.services.kill_switch_service import kill_switch_service
+
+    from app.services import otp_relay_readiness as relay_mod
+    monkeypatch.setattr(kill_switch_service, "is_active", lambda: True)
+    monkeypatch.setattr(relay_mod.otp_relay_readiness, "check",
+                        AsyncMock(return_value=OtpRelayReadiness(ready=True, channel="line_group", reason="ok")))
+    res = await _run(service, "/status", db=db_session)
+    assert res["status"] == "CLI_STATUS"
+    assert res["kill_active"] is True and res["relay_ready"] is True
+    assert service.replies[0]["type"] == "flex"
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_sender_is_denied(service, db_session, monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "LINE_SIMULATION_MODE", False)
+    monkeypatch.setattr(settings, "LINE_GROUP_ID", None)
+    res = await _run(service, "/status", db=db_session, source_type="room")
+    assert res["status"] == "CLI_UNAUTHORIZED"
+    assert "ไม่มีสิทธิ์" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_unknown_command_returns_error_with_suggestion(service, db_session):
+    res = await _run(service, "/prot", db=db_session)
+    assert res["status"] == "CLI_ERROR" and res["code"] == cli_parser.E_UNKNOWN_CMD
+    assert "port" in service.last_text()
+
+
+# --------------------------------------------------------------------------- #
+# /login /logout
+# --------------------------------------------------------------------------- #
+def _patch_relay(monkeypatch, ready=True, reason="ok", channel="line_group"):
+    from app.services import otp_relay_readiness as relay_mod
+    from app.services.otp_relay_readiness import OtpRelayReadiness
+    monkeypatch.setattr(
+        relay_mod.otp_relay_readiness, "check",
+        AsyncMock(return_value=OtpRelayReadiness(ready=ready, channel=channel, reason=reason)),
+    )
+    monkeypatch.setattr(
+        relay_mod, "assert_push_deliverable",
+        AsyncMock(return_value=(ready, reason if not ready else "reachable")),
+    )
+    monkeypatch.setattr(
+        relay_mod.otp_relay_readiness, "assert_push_deliverable",
+        AsyncMock(return_value=(ready, reason if not ready else "reachable")),
+    )
+
+
+@pytest.mark.asyncio
+async def test_login_never_fires_sms_when_relay_not_ready(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=False, reason="relay down")
+
+    res = await _run(service, "/login kss", db=db_session)
+    assert res["status"] == "CLI_RELAY_NOT_READY"
+    login.assert_not_awaited()                       # Invariant 9
+    assert "ยังไม่ส่ง SMS" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_login_kss_acks_then_pushes_success(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login kss", db=db_session)
+    assert res["status"] == "CLI_LOGIN" and res["results"][0]["status"] == "ok"
+    assert "กำลังเข้าระบบ" in service.last_text()      # ack first (reply)
+    assert any("สำเร็จ" in _text_of(m) for m, _ in service.pushes)
+    login.assert_awaited_once_with("kss", force=False)
+
+
+@pytest.mark.asyncio
+async def test_login_skips_when_already_alive_without_force(service, db_session, monkeypatch):
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login kss", db=db_session)   # fixture: session alive
+    assert res["results"][0]["status"] == "already_alive"
+    login.assert_not_awaited()
+    assert any("เชื่อมต่ออยู่แล้ว" in _text_of(m) for m, _ in service.pushes)
+
+
+@pytest.mark.asyncio
+async def test_login_all_is_sequential_kss_then_lib(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login all", db=db_session)
+    assert [r["broker"] for r in res["results"]] == ["kss", "lib"]
+    brokers = [c.args[0] for c in login.await_args_list]
+    assert brokers == ["kss", "lib"]
+
+
+@pytest.mark.asyncio
+async def test_login_pushes_error_when_broker_raises(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+
+    def boom(*a, **k):
+        raise NameError("name 'os' is not defined")
+
+    monkeypatch.setattr(handlers, "_login_via_daemon", boom)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login lib", db=db_session)
+    assert res["status"] == "CLI_LOGIN"
+    assert res["results"][0]["status"] == "failed"
+    assert any("เข้าระบบไม่สำเร็จ" in _text_of(m) and "NameError" in _text_of(m)
+               for m, _ in service.pushes)
+
+
+@pytest.mark.asyncio
+async def test_logout_lib_closes_liberator(service, db_session, monkeypatch):
+    from app.brokers import liberator_plugin
+    close = AsyncMock()
+    monkeypatch.setattr(liberator_plugin, "close", close)
+
+    res = await _run(service, "/logout lib", db=db_session)
+    assert res["status"] == "CLI_LOGOUT"
+    close.assert_awaited_once()
+    assert "ออกจากระบบ LIB" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_logout_when_not_logged_in(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    res = await _run(service, "/logout kss", db=db_session)
+    assert "ไม่ได้เข้าระบบอยู่แล้ว" in service.last_text()
+
+
+# --------------------------------------------------------------------------- #
+# CDP-3 — /login = attach (zero-OTP) · /logout = detach only
+# --------------------------------------------------------------------------- #
+ATTACHED_KSS = {
+    "broker": "kss",
+    "purpose": "streaming",
+    "state": "AUTHENTICATED",
+    "daemon_up": True,
+    "port": 9333,
+    "url_path": "/realtime/streaming7/StreamingPage.jsp",
+    "page_url": "https://wme2.settrade.com/realtime/streaming7/StreamingPage.jsp",
+    "attached": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_login_attaches_cdp_without_otp(service, db_session, monkeypatch):
+    """Probe AUTHENTICATED → attach; `session_login_broker` must NEVER be called."""
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(return_value=dict(ATTACHED_KSS)))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED"})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    # Relay down proves the attach path is truly zero-OTP: no SMS gate is consulted.
+    _patch_relay(monkeypatch, ready=False, reason="relay down")
+
+    res = await _run(service, "/login kss", db=db_session)
+
+    assert res["status"] == "CLI_LOGIN"
+    assert res["results"][0]["status"] == "attached"
+    assert res["results"][0]["port"] == 9333
+    assert res["results"][0]["url_path"] == "/realtime/streaming7/StreamingPage.jsp"
+    login.assert_not_awaited()                                    # Done-when #1
+    texts = [_text_of(m) for m, _ in service.pushes]
+    assert any("zero-OTP" in t and "9333" in t for t in texts)     # D2: push with port
+    assert not any("OTP 6 หลัก" in t for t in texts + [service.last_text()])
+
+
+@pytest.mark.asyncio
+async def test_login_all_attaches_both_without_otp(service, db_session, monkeypatch):
+    attach = AsyncMock(side_effect=[
+        dict(ATTACHED_KSS),
+        {**ATTACHED_KSS, "broker": "lib", "purpose": "portfolio", "port": 9334},
+    ])
+    monkeypatch.setattr(handlers, "_attach_session_cdp", attach)
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED"})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=False, reason="relay down")
+
+    res = await _run(service, "/login all", db=db_session)
+
+    assert [r["status"] for r in res["results"]] == ["attached", "attached"]
+    assert [r["port"] for r in res["results"]] == [9333, 9334]
+    login.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_login_force_never_attaches_and_still_asks_otp(service, db_session, monkeypatch):
+    """`force` stays the only path that opens a browser + OTP."""
+    attach = AsyncMock(return_value=dict(ATTACHED_KSS))
+    monkeypatch.setattr(handlers, "_attach_session_cdp", attach)
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login kss force", db=db_session)
+
+    attach.assert_not_awaited()
+    login.assert_awaited_once_with("kss", force=True)
+    assert res["results"][0]["status"] == "ok"
+    assert "OTP 6 หลัก" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_login_falls_back_to_otp_when_attach_fails(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(return_value=None))
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9334})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login lib", db=db_session)
+
+    assert res["results"][0]["status"] == "ok"
+    login.assert_awaited_once_with("lib", force=False)
+
+
+@pytest.mark.asyncio
+async def test_login_partial_attach_then_otp_for_the_rest(service, db_session, monkeypatch):
+    """`/login all` with only kss attached: lib still falls back to the OTP flow."""
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(side_effect=[dict(ATTACHED_KSS), None]))
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9334})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login all", db=db_session)
+
+    assert [(r["broker"], r["status"]) for r in res["results"]] == [("kss", "attached"), ("lib", "ok")]
+    login.assert_awaited_once_with("lib", force=False)
+
+
+@pytest.mark.asyncio
+async def test_login_all_probe_diverges_zero_otp_and_no_contradiction(service, db_session, monkeypatch):
+    """Ticket t_1a0abd4c / Done when:
+    When /login all runs and attach probe != alive check (attach None but alive True for kss),
+    both are authenticated:
+    1. 0 OTP / SMS text messages.
+    2. No 'กำลังเข้าระบบ' conflicting with already-alive state.
+    3. No contradictory messages (never both 'รอ OTP' and 'เชื่อมต่ออยู่แล้ว').
+    4. _login_via_daemon is NEVER called.
+    """
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(return_value=None))
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=True))
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED"})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login all", db=db_session)
+
+    assert res["status"] == "CLI_LOGIN"
+    assert [r["status"] for r in res["results"]] == ["already_alive", "already_alive"]
+    login.assert_not_awaited()
+
+    all_texts = [_text_of(m) for m, _ in service.pushes] + ([service.last_text()] if service.last_text() else [])
+    assert not any("OTP 6 หลัก" in t for t in all_texts)
+    assert not any("รอ OTP" in t for t in all_texts)
+    assert not any("กำลังเข้าระบบ" in t for t in all_texts)
+    assert any("KSS เชื่อมต่ออยู่แล้ว" in t for t in all_texts)
+    assert any("LIB เชื่อมต่ออยู่แล้ว" in t for t in all_texts)
+
+
+@pytest.mark.asyncio
+async def test_login_all_kss_otp_and_lib_alive_single_otp_with_channel_word(service, db_session, monkeypatch):
+    """Ticket t_1a0abd4c / Done when:
+    /login all when KSS genuinely needs OTP and LIB is already alive:
+    1. Only KSS gets OTP prompt; LIB is never prompted for OTP.
+    2. Uses dynamic channel word ('แชทนี้' for 1:1 user, 'กลุ่มนี้' for group).
+    3. No broker gets contradictory messages.
+    """
+    monkeypatch.setattr(handlers, "_attach_session_cdp", AsyncMock(return_value=None))
+
+    async def fake_alive(broker, *args, **kwargs):
+        return broker == "lib"
+    monkeypatch.setattr(handlers, "_broker_session_alive", fake_alive)
+
+    login = AsyncMock(return_value={"status": "spawned", "state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr(handlers, "_login_via_daemon", login)
+    _patch_relay(monkeypatch, ready=True)
+
+    res = await _run(service, "/login all", db=db_session, user_id="U_OP", group_id=None)
+
+    assert res["status"] == "CLI_LOGIN"
+    assert [(r["broker"], r["status"]) for r in res["results"]] == [("lib", "already_alive"), ("kss", "ok")]
+    login.assert_awaited_once_with("kss", force=False)
+
+    push_texts = [_text_of(m) for m, _ in service.pushes]
+    assert any("LIB เชื่อมต่ออยู่แล้ว" in t for t in push_texts)
+    assert not any("เป็นรหัสของ LIB" in t for t in push_texts)
+
+    last_reply = service.last_text()
+    assert "กำลังเข้าระบบ KSS" in last_reply
+    assert "LIB" not in last_reply
+    assert "แชทนี้" in last_reply
+    assert "กลุ่มนี้" not in last_reply
+
+
+@pytest.mark.asyncio
+async def test_attach_session_cdp_returns_none_when_probe_not_authenticated(monkeypatch):
+    probe = AsyncMock(return_value={"state": "LOGIN_PAGE", "port": 9333})
+    monkeypatch.setattr("app.services.broker_cdp.session_probe.cdp_session_status", probe)
+    from app.browser.streaming_driver import streaming_driver
+    connect = AsyncMock(return_value=True)
+    monkeypatch.setattr(streaming_driver, "connect_cdp", connect)
+
+    assert await REAL_ATTACH_SESSION_CDP("kss") is None
+    connect.assert_not_awaited()          # never attach blindly
+
+
+@pytest.mark.asyncio
+async def test_attach_session_cdp_connects_kss_streaming_tab(monkeypatch):
+    probe = AsyncMock(return_value={"state": "AUTHENTICATED", "port": 9333,
+                                    "url_path": "/realtime/streaming7/StreamingPage.jsp"})
+    monkeypatch.setattr("app.services.broker_cdp.session_probe.cdp_session_status", probe)
+    from app.browser.streaming_driver import StreamingDriver, streaming_driver
+    fake_page = SimpleNamespace(url="https://wme2.settrade.com/realtime/streaming7/StreamingPage.jsp")
+    monkeypatch.setattr(StreamingDriver, "page", property(lambda self: fake_page))
+    connect = AsyncMock(return_value=True)
+    monkeypatch.setattr(streaming_driver, "connect_cdp", connect)
+
+    out = await REAL_ATTACH_SESSION_CDP("kss")
+
+    assert out["attached"] is True
+    assert out["page_url"] == fake_page.url
+    connect.assert_awaited_once_with(target="streaming")
+
+
+@pytest.mark.asyncio
+async def test_attach_session_cdp_connects_liberator_portfolio_tab(monkeypatch):
+    probe = AsyncMock(return_value={"state": "AUTHENTICATED", "port": 9334})
+    monkeypatch.setattr("app.services.broker_cdp.session_probe.cdp_session_status", probe)
+    from app.brokers.liberator.driver import liberator_driver
+    fake_page = SimpleNamespace(url="https://webtrade.liberator.co.th/Portfolio")
+    monkeypatch.setattr(liberator_driver, "page", fake_page)
+    connect = AsyncMock(return_value=True)
+    monkeypatch.setattr(liberator_driver, "connect_cdp", connect)
+
+    out = await REAL_ATTACH_SESSION_CDP("lib")
+
+    assert out["attached"] is True
+    assert out["port"] == 9334
+    assert connect.await_args.kwargs["target"] == "portfolio"
+
+
+@pytest.mark.asyncio
+async def test_attach_session_cdp_returns_none_when_connect_fails(monkeypatch):
+    probe = AsyncMock(return_value={"state": "AUTHENTICATED", "port": 9333})
+    monkeypatch.setattr("app.services.broker_cdp.session_probe.cdp_session_status", probe)
+    from app.browser.streaming_driver import streaming_driver
+    monkeypatch.setattr(streaming_driver, "connect_cdp", AsyncMock(return_value=False))
+
+    assert await REAL_ATTACH_SESSION_CDP("kss") is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_disconnect_cdp_never_closes_the_browser():
+    from app.browser.streaming_driver import StreamingDriver
+    drv = StreamingDriver()
+    pw, browser = AsyncMock(), AsyncMock()
+    page = SimpleNamespace(url="https://wme2.settrade.com/realtime/streaming7/StreamingPage.jsp")
+    drv._cdp_pw, drv._cdp_browser, drv._cdp_context = pw, browser, AsyncMock()
+    drv.page_override, drv._cdp_connected = page, True
+
+    assert await drv.disconnect_cdp() is True
+
+    pw.stop.assert_awaited_once()
+    browser.close.assert_not_awaited()                 # daemon's Chrome must stay open
+    assert drv._cdp_connected is False and drv.page_override is None
+    assert await drv.disconnect_cdp() is False         # idempotent
+
+
+@pytest.mark.asyncio
+async def test_logout_kss_detaches_cdp_and_keeps_daemon_tab(service, db_session, monkeypatch):
+    detach = AsyncMock(return_value=True)
+    monkeypatch.setattr(handlers, "_detach_session_cdp", detach)
+    from app.browser.auth_driver import auth_driver
+    close = AsyncMock()
+    monkeypatch.setattr(auth_driver, "close", close)
+    monkeypatch.setattr(handlers, "_close_owned_browsers", AsyncMock(return_value=False))
+
+    res = await _run(service, "/logout kss", db=db_session)
+
+    assert res["status"] == "CLI_LOGOUT"
+    detach.assert_awaited_once_with("kss")
+    text = service.last_text()
+    assert "ตัดการเชื่อมต่อจากโปรเซสนี้" in text
+    assert "CDP 9333" in text and "แท็บยังเปิดอยู่" in text
+    assert "ปิด browser" not in text
+
+
+# --------------------------------------------------------------------------- #
+# CDP-4 — `_broker_session_alive` reads the probe (non-money sites only)
+#          G3 money guard must still call it with allow_cdp=False
+# --------------------------------------------------------------------------- #
+REAL_BROKER_SESSION_ALIVE = handlers._broker_session_alive
+
+
+def _patch_probe(monkeypatch, state, *, daemon_up=True, port=9333, raises=None):
+    """Patch the read-only probe (the exact seam `_broker_session_alive` imports)."""
+    if raises is not None:
+        probe = AsyncMock(side_effect=raises)
+    else:
+        probe = AsyncMock(return_value={
+            "broker": "kss", "purpose": "streaming", "state": state,
+            "daemon_up": daemon_up, "port": port, "target_found": daemon_up,
+            "url_path": "/realtime/streaming7/StreamingPage.jsp",
+        })
+    monkeypatch.setattr("app.services.broker_cdp.session_probe.cdp_session_status", probe)
+    return probe
+
+
+def _patch_flags(monkeypatch, *, kss=False, lib=False):
+    """Pin the legacy in-process flags — no daemon, no browser, no login."""
+    from app.browser.auth_driver import auth_driver
+    from app.brokers import liberator_plugin
+    monkeypatch.setattr(handlers, "_broker_session_alive", REAL_BROKER_SESSION_ALIVE)
+    monkeypatch.setattr(type(auth_driver), "is_authenticated", property(lambda self: kss))
+    monkeypatch.setattr(liberator_plugin, "get_health",
+                        AsyncMock(return_value={"is_authenticated": lib}))
+
+
+@pytest.mark.asyncio
+async def test_session_alive_true_from_probe_even_when_flag_is_false(monkeypatch):
+    """The whole point: gateway restarted (flag False) but daemon tab is authenticated."""
+    probe = _patch_probe(monkeypatch, "AUTHENTICATED")
+    _patch_flags(monkeypatch, kss=False)
+
+    assert await REAL_BROKER_SESSION_ALIVE("kss") is True
+    probe.assert_awaited_once()
+    assert probe.await_args.kwargs["purpose"] == "streaming"     # same purpose as /status
+
+
+@pytest.mark.asyncio
+async def test_session_alive_lib_probes_the_portfolio_tab(monkeypatch):
+    probe = _patch_probe(monkeypatch, "AUTHENTICATED", port=9334)
+    _patch_flags(monkeypatch, lib=False)
+
+    assert await REAL_BROKER_SESSION_ALIVE("lib") is True
+    assert probe.await_args.kwargs["purpose"] == "portfolio"
+
+
+@pytest.mark.asyncio
+async def test_session_alive_falls_back_to_flag_when_daemon_down(monkeypatch):
+    _patch_probe(monkeypatch, "DAEMON_DOWN", daemon_up=False)
+    _patch_flags(monkeypatch, kss=True)
+
+    assert await REAL_BROKER_SESSION_ALIVE("kss") is True       # legacy behaviour kept
+
+
+@pytest.mark.asyncio
+async def test_session_alive_login_page_does_not_count_as_alive(monkeypatch):
+    _patch_probe(monkeypatch, "LOGIN_PAGE")
+    _patch_flags(monkeypatch, kss=False)
+
+    assert await REAL_BROKER_SESSION_ALIVE("kss") is False
+
+
+@pytest.mark.asyncio
+async def test_session_alive_probe_error_falls_back_to_flag(monkeypatch):
+    _patch_probe(monkeypatch, None, raises=RuntimeError("cdp exploded"))
+    _patch_flags(monkeypatch, kss=True)
+
+    assert await REAL_BROKER_SESSION_ALIVE("kss") is True
+
+
+@pytest.mark.asyncio
+async def test_session_alive_allow_cdp_false_never_touches_the_probe(monkeypatch):
+    """`allow_cdp=False` is the money-guard contract: flags only, probe untouched."""
+    probe = _patch_probe(monkeypatch, "AUTHENTICATED")
+    _patch_flags(monkeypatch, kss=False)
+
+    assert await REAL_BROKER_SESSION_ALIVE("kss", allow_cdp=False) is False
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_guard_calls_session_alive_with_cdp_by_default(service, db_session, monkeypatch):
+    """CDP-5: G3 defaults to allow_cdp=True via LINE_NEGO_CDP_GATE."""
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_NEGO_EMPTY"          # passed G3, no orders to amend
+    alive = handlers._broker_session_alive
+    assert alive.await_args_list, "G3 never checked the session"
+    assert alive.await_args.kwargs.get("allow_cdp") is True
+    assert alive.await_args.kwargs.get("fail_closed") is True
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_guard_calls_session_alive_without_cdp_when_flag_disabled(service, db_session, monkeypatch):
+    """Emergency rollback: LINE_NEGO_CDP_GATE=False keeps legacy flag-only check."""
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "LINE_NEGO_CDP_GATE", False)
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_NEGO_EMPTY"
+    alive = handlers._broker_session_alive
+    assert alive.await_args.kwargs.get("allow_cdp") is False
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_accepts_cdp_authenticated_when_flag_false(service, db_session, monkeypatch):
+    """CDP-5: probe=AUTHENTICATED + flag=False -> G3 passes."""
+    _patch_probe(monkeypatch, "AUTHENTICATED")
+    _patch_flags(monkeypatch, kss=False)
+
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_NEGO_EMPTY"          # passed G3, no orders to amend
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_blocks_unknown_even_when_flag_true(service, db_session, monkeypatch):
+    """CDP-5: probe=UNKNOWN -> G3 blocks (fail-closed, even if in-process flag is True)."""
+    _patch_probe(monkeypatch, "UNKNOWN")
+    _patch_flags(monkeypatch, kss=True)
+
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_SESSION_DOWN"
+    assert "🔴 KSS session หลุด (CDP: UNKNOWN) — /login kss force" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_blocks_daemon_down(service, db_session, monkeypatch):
+    """CDP-5: probe=DAEMON_DOWN -> G3 blocks and shows honest reason."""
+    _patch_probe(monkeypatch, "DAEMON_DOWN", daemon_up=False)
+    _patch_flags(monkeypatch, kss=False)
+
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_SESSION_DOWN"
+    assert "🔴 KSS session หลุด (CDP: DAEMON_DOWN) — /login kss force" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_still_blocks_login_page_and_shows_honest_error(service, db_session, monkeypatch):
+    """The gate must stay fail-closed: LOGIN_PAGE is not a session, whatever the flag."""
+    _patch_probe(monkeypatch, "LOGIN_PAGE")
+    _patch_flags(monkeypatch, kss=False)
+
+    res = await _run(service, "/nego kss", db=db_session)
+
+    assert res["status"] == "CLI_SESSION_DOWN"
+    assert "🔴 KSS session หลุด (CDP: LOGIN_PAGE) — /login kss force" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_port_sync_works_without_login_when_daemon_authenticated(service, db_session, monkeypatch):
+    """`/port <b> sync` must read live data after a restart — no `/login` first."""
+    _patch_probe(monkeypatch, "AUTHENTICATED")
+    _patch_flags(monkeypatch, kss=False)
+
+    res = await _run(service, "/port kss sync", db=db_session)
+
+    assert res["status"] == "CLI_SYNC"
+    assert all("session หลุด" not in _text_of(m) for m in service.replies)
+
+
+@pytest.mark.asyncio
+async def test_cash_sync_works_without_login_when_daemon_authenticated(service, db_session, monkeypatch):
+    _patch_probe(monkeypatch, "AUTHENTICATED", port=9334)
+    _patch_flags(monkeypatch, lib=False)
+
+    res = await _run(service, "/cash lib sync", db=db_session)
+
+    assert res["status"] == "CLI_SYNC"
+    assert not any("session หลุด" in _text_of(m) for m in service.replies)
+
+
+@pytest.mark.asyncio
+async def test_logout_reports_a_real_logout_from_probe_truth(service, db_session, monkeypatch):
+    _patch_probe(monkeypatch, "AUTHENTICATED")
+    _patch_flags(monkeypatch, kss=False)
+    monkeypatch.setattr(handlers, "_detach_session_cdp", AsyncMock(return_value=False))
+    monkeypatch.setattr(handlers, "_close_owned_browsers", AsyncMock(return_value=False))
+
+    await _run(service, "/logout kss", db=db_session)
+
+    text = service.last_text()
+    assert "ออกจากระบบ" in text and "ไม่ได้เข้าระบบอยู่แล้ว" not in text
+
+
+# --------------------------------------------------------------------------- #
+# /port /orders /cash
+# --------------------------------------------------------------------------- #
+async def _seed_position(db, symbol="PTT", volume=1000, avg_cost=13.20, current_price=13.50, account_no="<REDACTED_KSS_ACCT>", broker="kss"):
+    from app.db.models import Position, BrokerAccount
+    db.add(BrokerAccount(account_no=account_no, broker=broker))
+    db.add(Position(symbol=symbol, account_no=account_no, position_type="LONG", volume=volume, avg_cost=avg_cost,
+                    current_price=current_price, unrealized_pnl=(current_price - avg_cost) * volume))
+    await db.commit()
+
+
+async def _seed_order(db, order_id="ORD-1", symbol="PTT", side="BUY", volume=1000, price=34.0, status="OPEN"):
+    from app.db.models import Order
+    db.add(Order(order_id=order_id, symbol=symbol, side=side, volume=volume, price=price,
+                 status=status, source="test_seed"))
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_port_default_always_syncs_live(service, db_session):
+    res = await _run(service, "/port kss", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    assert "กำลังดึงข้อมูลสด" in service.last_text()
+    assert service.pushes and service.pushes[0][1] == "U_OP"
+
+
+@pytest.mark.asyncio
+async def test_port_refuses_when_session_down(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    res = await _run(service, "/port kss", db=db_session)
+    assert res["status"] == "CLI_SESSION_DOWN"
+    assert "session หลุด" in service.last_text()          # Invariant 7 — no auto-login
+
+
+@pytest.mark.asyncio
+async def test_port_sync_refuses_when_session_down(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    res = await _run(service, "/port kss sync", db=db_session)
+    assert res["status"] == "CLI_SESSION_DOWN"
+    assert "session หลุด" in service.last_text()          # Invariant 7 — no auto-login
+
+
+@pytest.mark.asyncio
+async def test_port_sync_acks_then_pushes_live_card(service, db_session):
+    res = await _run(service, "/port kss sync", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    assert "กำลังดึงข้อมูลสด" in service.last_text()          # ack via reply
+    assert service.pushes and service.pushes[0][1] == "U_OP"  # pushed to the sender
+
+
+@pytest.mark.asyncio
+async def test_port_sync_persists_cdp_snapshot(service, db_session, monkeypatch):
+    sync = AsyncMock(return_value={"broker": "KRUNGSRI", "account_no": "<REDACTED_KSS_ACCT>"})
+    monkeypatch.setattr(handlers, "_broker_sync_cdp", sync)
+    res = await _run(service, "/port kss sync", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    sync.assert_awaited_once_with("kss")
+
+
+@pytest.mark.asyncio
+async def test_orders_sync_does_not_persist_portfolio(service, db_session, monkeypatch):
+    sync = AsyncMock(return_value=None)
+    monkeypatch.setattr(handlers, "_broker_sync_cdp", sync)
+    res = await _run(service, "/orders kss sync", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orders_default_always_syncs_live(service, db_session):
+    res = await _run(service, "/orders kss", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    assert "กำลังดึงข้อมูลสด" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_cash_default_always_syncs_live(service, db_session):
+    res = await _run(service, "/cash lib", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    assert "กำลังดึงข้อมูลสด" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_sync_duplicate_is_busy(service, db_session):
+    lock = handlers._lock_for("port", "kss")
+    await lock.acquire()
+    try:
+        res = await _run(service, "/port kss sync", db=db_session)
+    finally:
+        lock.release()
+    assert res["status"] == "CLI_BUSY"
+    assert "กำลังทำงานอยู่" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_port_all_sync_pushes_summary_then_per_stock_cards(service, db_session, monkeypatch):
+    import json
+    from app.services.broker_cdp import sync_service
+
+    async def fake_scrape(broker):
+        if broker == "kss":
+            return {"broker": "KRUNGSRI", "account_no": "MARGIN",
+                    "holdings": [
+                        {"symbol": "PTT", "position_type": "LONG", "volume": 1000,
+                         "avg_cost": 30.0, "current_price": 31.0},
+                        {"symbol": "BCPG", "position_type": "BORROWED", "volume": 200},
+                    ]}
+        return {"broker": "LIBERATOR", "account_no": "CASH",
+                "holdings": [
+                    {"symbol": "CPALL", "position_type": "LONG", "volume": 300,
+                     "avg_cost": 55.0, "current_price": 54.0},
+                ]}
+
+    monkeypatch.setattr(sync_service, "scrape_portfolio_from_cdp",
+                        AsyncMock(side_effect=fake_scrape))
+    # Pin the borrow book: otherwise this test reads the live SBL ledger through CDP,
+    # which silently rewrites the BCPG quantity (100 on the page vs 200 in the fixture).
+    monkeypatch.setattr(handlers, "_live_sbl_lots", AsyncMock(return_value=({}, "test")))
+    res = await _run(service, "/port all sync", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+    assert service.pushes and service.pushes[0][1] == "U_OP"
+
+    flat = json.dumps([m for m, _u in service.pushes], ensure_ascii=False)
+    assert "พอร์ตรวม" in flat                 # summary การ์ดหน้าคงยอดรวม
+    assert "/sell lib CPALL 300" in flat      # LIB LONG → Sell
+    assert "/short kss BCPG 200" in flat      # KSS borrowed → Short
+    assert "/return BCPG all" in flat         # KSS borrowed → Return
+    assert "/sell kss PTT" not in flat        # KSS LONG → ไม่มีปุ่ม Sell
+
+
+@pytest.mark.asyncio
+async def test_port_pagination_exceeding_5_cards_postback(service, db_session, monkeypatch):
+    """When portfolio produces >5 cards, batch 1 is 5 cards with a next-page quick reply, and postback fetches page 2."""
+    from app.services.broker_cdp import sync_service
+
+    # Create 7 stock cards
+    stocks = [
+        {"symbol": f"STK{i}", "position_type": "LONG", "volume": 100 * i, "avg_cost": 10.0, "current_price": 11.0}
+        for i in range(1, 8)
+    ]
+    async def fake_many_stocks(broker):
+        if broker == "kss":
+            return {"broker": "KRUNGSRI", "account_no": "MARGIN", "holdings": stocks}
+        return {"broker": "LIBERATOR", "account_no": "CASH", "holdings": []}
+
+    monkeypatch.setattr(sync_service, "scrape_portfolio_from_cdp", AsyncMock(side_effect=fake_many_stocks))
+    monkeypatch.setattr(handlers, "_live_sbl_lots", AsyncMock(return_value=({}, "test")))
+    # Return 7 stock cards so 7 stocks + 1 summary = 8 cards total (> 5 cards)
+    from app.services.line_cli import cards as cli_cards
+    monkeypatch.setattr(cli_cards, "portfolio_stock_cards", lambda **kw: [{"type": "flex", "altText": f"Card {i}", "contents": {"type": "bubble"}} for i in range(1, 8)])
+
+    res = await _run(service, "/port all sync", db=db_session)
+    assert res["status"] == "CLI_SYNC"
+
+    # Should have delivered exactly 5 cards in batch 1
+    p1_items = service.pushes[-1][0]
+    assert isinstance(p1_items, list)
+    assert len(p1_items) == 5
+
+    # 5th card should carry quickReply for page 2
+    last_card = p1_items[-1]
+    qr = last_card.get("quickReply", {})
+    qr_items = qr.get("items", [])
+    assert len(qr_items) >= 1
+    postback_data = qr_items[0]["action"]["data"]
+    assert "action=port_page" in postback_data
+    assert "page=2" in postback_data
+
+    # Now simulate user tapping 'ดูหน้าถัดไป (2)'
+    pb_res = await handlers.handle_postback(
+        postback_data, db=db_session, raw_event=_event(), service=service
+    )
+    assert pb_res["status"] == "PAGE_DELIVERED"
+    assert pb_res["page"] == 2
+
+    # Batch 2 should deliver the remaining 3 cards (8 - 5 = 3)
+    p2_items = service.pushes[-1][0]
+    assert isinstance(p2_items, list)
+    assert len(p2_items) == 3
+
+
+
+# --------------------------------------------------------------------------- #
+# /nego — guardrails G1–G6
+# --------------------------------------------------------------------------- #
+def _open_order(order_no="12345", symbol="PTT", side="BUY", price=34.00, balance=1000):
+    return {"broker_order_no": order_no, "symbol": symbol, "side": side,
+            "price": price, "balance": balance, "volume": balance, "status": "Open"}
+
+
+def _quote(bid_1=None, offer_1=None, last=None, source="test"):
+    return {"symbol": "PTT", "bid_1": bid_1, "offer_1": offer_1, "last": last, "source": source}
+
+
+@pytest.mark.asyncio
+async def test_nego_g1_kill_switch_blocks(service, db_session, monkeypatch):
+    from app.services.kill_switch_service import kill_switch_service
+    monkeypatch.setattr(kill_switch_service, "is_active", lambda: True)
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_KILL_SWITCH"
+    assert "KILL-SWITCH" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_nego_g2_out_of_hours_blocks(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_in_nego_window", lambda now=None: False)
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_OUT_OF_HOURS"
+
+
+@pytest.mark.asyncio
+async def test_nego_g3_session_down_blocks(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_session_alive", AsyncMock(return_value=False))
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_SESSION_DOWN"
+
+
+@pytest.mark.asyncio
+async def test_nego_amends_order_and_audits(service, db_session, monkeypatch):
+    from app.db.models import SessionLog
+    from sqlalchemy import select
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[_open_order()]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=34.20, offer_1=34.30, last=34.00)))
+
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_NEGO" and res["ok"] == 1 and res["failed"] == 0
+    handlers._broker_modify.assert_awaited_once()
+    assert handlers._broker_modify.await_args.args[0] == "kss"      # broker isolation
+    assert service.pushes and service.pushes[-1][0]["type"] == "flex"
+    logs = (await db_session.execute(select(SessionLog).where(SessionLog.event_type == "LINE_CLI_NEGO"))).scalars().all()
+    assert len(logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_nego_g5_too_many_ticks_is_skipped(service, db_session, monkeypatch):
+    # SQ-6: kss now delegates planning to the Quick Trade service, so the
+    # handler-level G5 pre-check is exercised on the lib path.
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[_open_order(price=34.00)]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=36.00, offer_1=36.25)))
+
+    res = await _run(service, "/nego lib", db=db_session)
+    assert res["skipped"] == 1 and res["ok"] == 0
+    handlers._broker_modify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nego_fails_closed_when_quote_unavailable(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[_open_order()]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(source="unavailable")))
+
+    res = await _run(service, "/nego lib", db=db_session)
+    assert res["skipped"] == 1 and res["ok"] == 0
+    handlers._broker_modify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nego_g6_short_uptick_is_skipped(service, db_session, monkeypatch):
+    # SQ-6: kss G6 is enforced inside the Quick Trade service; the handler
+    # pre-check remains on the lib path.
+    monkeypatch.setattr(handlers, "_broker_open_orders",
+                        AsyncMock(return_value=[_open_order(side="SHORT", price=33.50)]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(offer_1=34.00, last=34.25)))
+
+    res = await _run(service, "/nego lib", db=db_session)
+    assert res["skipped"] == 1 and res["ok"] == 0
+    handlers._broker_modify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nego_kss_trademan_cancel_replace_mode(service, db_session, monkeypatch):
+    """KSS_AMEND_MODE=trademan_cancel_replace routes /nego kss to cancel+re-submit."""
+    monkeypatch.setattr(handlers.settings, "KSS_AMEND_MODE", "trademan_cancel_replace")
+    monkeypatch.setattr(handlers, "_broker_open_orders",
+                        AsyncMock(return_value=[_open_order(order_no="1", side="BUY")]))
+    calls = {}
+
+    async def fake_cr(**kw):
+        calls.update(kw)
+        return {"success": True, "submitted": True, "new_order_no": "2",
+                "current_price": 34.0, "target_price": 34.25, "outcome": "OK", "reason": "x"}
+
+    monkeypatch.setattr(handlers, "_kss_cancel_replace", fake_cr)
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["ok"] == 1
+    assert calls["order_no"] == "1"
+    handlers._broker_modify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_kss_cancel_replace_dry_run_never_touches_the_broker(monkeypatch):
+    """DRY_RUN: plan only — a cancel is irreversible and must never be staged."""
+    import app.browser.trademan_driver as tmd
+
+    monkeypatch.setattr(handlers.settings, "DRY_RUN_MODE", True)
+    monkeypatch.setattr(handlers, "_quote_via_gateway_browser", AsyncMock(
+        return_value={"success": True, "best_bid": 34.20, "best_offer": 34.30, "last": 34.00}))
+    monkeypatch.setattr(tmd.trademan_driver, "cancel_order", AsyncMock())
+
+    res = await handlers._kss_cancel_replace(order_no="1", symbol="PTT", side="BUY",
+                                             volume=100, old_price=34.00)
+    assert res["success"] is True and res["submitted"] is False
+    assert res["target_price"] == 34.20
+    tmd.trademan_driver.cancel_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nego_filters_by_target_symbol(service, db_session, monkeypatch):
+    orders = [_open_order(order_no="1", symbol="PTT"), _open_order(order_no="2", symbol="AOT")]
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=orders))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=34.20)))
+
+    res = await _run(service, "/nego kss PTT", db=db_session)
+    assert res["ok"] == 1
+    assert handlers._broker_modify.await_args.kwargs["symbol"] == "PTT"
+
+
+@pytest.mark.asyncio
+async def test_nego_empty_queue_is_honest(service, db_session):
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_NEGO_EMPTY"
+    assert "ไม่มีออเดอร์ค้าง" in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_nego_duplicate_is_busy(service, db_session):
+    lock = handlers._lock_for("nego", "kss")
+    await lock.acquire()
+    try:
+        res = await _run(service, "/nego kss", db=db_session)
+    finally:
+        lock.release()
+    assert res["status"] == "CLI_BUSY"
+
+
+# --------------------------------------------------------------------------- #
+# /nego kss LIVE -> Streaming CDP in-place (100% CDP :9333 alignment)
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_broker_open_orders_kss_reads_the_cdp_ledger(monkeypatch):
+    """The order numbers we amend must come from CDP :9333 Streaming order ledger."""
+    from app.services.broker_cdp import sync_service
+
+    monkeypatch.setattr(handlers, "_broker_open_orders", REAL_BROKER_OPEN_ORDERS)
+    monkeypatch.setattr(sync_service, "scrape_orders_from_cdp", AsyncMock(return_value={
+        "broker": "KRUNGSRI", "account_no": "<REDACTED_KSS_ACCT>", "orders": [{"broker_order_no": "1", "balance": 100, "status": "OPEN"}],
+    }))
+
+    orders = await handlers._broker_open_orders("kss")
+    assert [o["order_no"] for o in orders] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_broker_open_orders_kss_fails_closed_when_the_ledger_is_unreadable(monkeypatch):
+    """Anti-Mock: an unreadable ledger must never look like an empty order book."""
+    from app.services.broker_cdp import sync_service
+
+    monkeypatch.setattr(handlers, "_broker_open_orders", REAL_BROKER_OPEN_ORDERS)
+    monkeypatch.setattr(sync_service, "scrape_orders_from_cdp", AsyncMock(side_effect=RuntimeError("CDP daemon down")))
+
+    with pytest.raises(RuntimeError):
+        await handlers._broker_open_orders("kss")
+
+
+@pytest.mark.asyncio
+async def test_broker_modify_kss_live_uses_streaming_cdp_in_place(monkeypatch):
+    """D1: the LIVE kss route calls streaming_driver.change_order_native via CDP."""
+    import app.browser.streaming_driver as sd
+    from app.services.trade_dispatcher import trade_dispatcher
+
+    monkeypatch.setattr(handlers, "_broker_modify", REAL_BROKER_MODIFY)
+    monkeypatch.setattr(type(trade_dispatcher), "is_live", property(lambda self: True))
+    mock_change = AsyncMock(return_value={
+        "success": True, "status": "MODIFIED_IN_PLACE", "stage": "verified",
+        "broker_order_no": "12345", "new_price": 34.25,
+    })
+    monkeypatch.setattr(sd.streaming_driver, "change_order_native", mock_change)
+
+    res = await handlers._broker_modify("kss", order_no="12345", new_price=34.25,
+                                        symbol="PTT", side="BUY", volume=1000)
+
+    assert res["path"] == "STREAMING_CDP"
+    assert res["success"] is True
+    mock_change.assert_awaited_once_with(
+        broker_order_no="12345",
+        new_price=34.25,
+        new_volume=1000,
+        pin=handlers.settings.KRUNGSRI_PIN,
+        symbol="PTT",
+        side="BUY",
+        auto_launch=True,
+    )
+
+
+def test_quicktrade_refusal_is_a_skip_not_an_ok():
+    row = {"order_no": "12345", "symbol": "PTT", "side": "BUY", "old_price": 34.00, "volume": 1000}
+    handlers._apply_quicktrade_result(row, {
+        "success": False, "outcome": "MAX_TICKS_EXCEEDED", "current_price": 34.00,
+        "target_price": None, "reason": "target 40.00 is 24 ticks away from 34.00",
+    })
+    assert row["status"] == "skip" and "tick" in row["reason"]
+    assert row["old_price"] == 34.00             # card shows the price the ledger reported
+
+
+def test_quicktrade_dry_run_row_is_marked_not_sent():
+    row = {"order_no": "12345", "symbol": "PTT", "side": "BUY", "old_price": 34.00, "volume": 1000}
+    handlers._apply_quicktrade_result(row, {
+        "success": True, "outcome": "OK", "submitted": False, "dry_run": True,
+        "current_price": 34.00, "target_price": 34.25,
+    })
+    assert row["status"] == "ok" and "DRY-RUN" in row["reason"]
+    assert row["new_price"] == 34.25             # the price Quick Trade actually staged
+
+
+@pytest.mark.asyncio
+async def test_nego_kss_live_refusal_is_reported_as_skipped(service, db_session, monkeypatch):
+    """The card/audit counts follow the Quick Trade outcome, not the handler preview."""
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[_open_order()]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=34.25)))
+    monkeypatch.setattr(handlers, "_broker_modify", AsyncMock(return_value={
+        "success": False, "outcome": "MAX_TICKS_EXCEEDED", "path": "QUICKTRADE_INPLACE",
+        "current_price": 34.00, "target_price": None, "reason": "too far",
+    }))
+
+    res = await _run(service, "/nego kss", db=db_session)
+    assert res["status"] == "CLI_NEGO"
+    assert res["ok"] == 0 and res["skipped"] == 1 and res["failed"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Webhook E2E — the router really runs inside _handle_text_message
+# --------------------------------------------------------------------------- #
+HEADERS = {"X-Line-Signature": "mock_signature"}
+
+
+def _webhook_payload(text, *, user_id="U_OP", source_type="user"):
+    return {"events": [{
+        "type": "message", "timestamp": 1718000000000,
+        "source": {"type": source_type, "userId": user_id},
+        "replyToken": "tok-cli-webhook",
+        "message": {"type": "text", "id": "msg-cli", "text": text},
+    }]}
+
+
+@pytest.mark.asyncio
+async def test_webhook_routes_slash_status_to_cli(client, db_session, monkeypatch):
+    from app.services.line_service import line_service
+    monkeypatch.setattr(line_service, "_send_reply", AsyncMock())
+    _patch_relay(monkeypatch, ready=True)
+
+    resp = await client.post("/api/v1/webhook/line", json=_webhook_payload("/status"), headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert results and results[0]["status"] == "CLI_STATUS"
+
+
+@pytest.mark.asyncio
+async def test_webhook_still_ignores_plain_text(client, db_session, monkeypatch):
+    from app.services.line_service import line_service
+    monkeypatch.setattr(line_service, "_send_reply", AsyncMock())
+
+    resp = await client.post("/api/v1/webhook/line", json=_webhook_payload("hello homelab"), headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert results and results[0]["status"] == "IGNORED"
+
+
+# --------------------------------------------------------------------------- #
+# RCA-006b / RCA-009 — live /port|cash cards must never claim 🟢 on unreadable data
+# --------------------------------------------------------------------------- #
+def _flex_text(card) -> str:
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _cdp_portfolio_snap(**over):
+    """Shape ``scrape_portfolio_from_cdp`` returns (N0 rewrite of ``_live_card``)."""
+    snap = {"account_no": "<REDACTED_KSS_ACCT>", "account_type": "MARGIN",
+            "line_available": 250_000.0, "cash_balance": None,
+            "credit_limit": None, "excess_equity": None, "total_equity": None,
+            "holdings": []}
+    snap.update(over)
+    return snap
+
+
+def _patch_cdp_portfolio(monkeypatch, snap=None, *, exc=None):
+    from app.services.broker_cdp import sync_service
+    if exc is not None:
+        monkeypatch.setattr(sync_service, "scrape_portfolio_from_cdp",
+                            AsyncMock(side_effect=exc))
+    else:
+        monkeypatch.setattr(sync_service, "scrape_portfolio_from_cdp",
+                            AsyncMock(return_value=snap or _cdp_portfolio_snap()))
+
+
+def _patch_cdp_orders(monkeypatch, orders=None, *, exc=None):
+    from app.services.broker_cdp import sync_service
+    if exc is not None:
+        monkeypatch.setattr(sync_service, "scrape_orders_from_cdp",
+                            AsyncMock(side_effect=exc))
+    else:
+        monkeypatch.setattr(sync_service, "scrape_orders_from_cdp",
+                            AsyncMock(return_value={"broker": "KRUNGSRI",
+                                                    "account_no": "<REDACTED_KSS_ACCT>",
+                                                    "orders": orders or []}))
+
+
+@pytest.mark.asyncio
+async def test_live_port_card_shows_dom_account_when_authenticated(monkeypatch):
+    snap = _cdp_portfolio_snap(account_no="<REDACTED_KSS_ACCT>", holdings=[
+        {"symbol": "PTT", "volume": 1000, "avg_cost": 34.0, "current_price": 35.0,
+         "position_type": "LONG"}])
+    _patch_cdp_portfolio(monkeypatch, snap)
+
+    card = await REAL_LIVE_CARD("port", "kss")
+
+    text = _flex_text(card)
+    assert "<REDACTED_KSS_ACCT>" in text        # account number read from the CDP scrape
+    assert "🟢 live" in text
+    assert "อ่านไม่ได้" not in text
+
+
+@pytest.mark.asyncio
+async def test_live_port_card_is_unavailable_when_scrape_not_authenticated(monkeypatch):
+    _patch_cdp_portfolio(monkeypatch, exc=RuntimeError("no authenticated tab"))
+
+    card = await REAL_LIVE_CARD("port", "kss")
+
+    text = _flex_text(card)
+    assert "อ่านไม่ได้" in text and "session หมดอายุ" in text
+    assert "/login kss" in text
+    assert "🟢 live" not in text
+    assert "มูลค่ารวม" not in text   # no fabricated totals for a failed scrape
+    assert "Amount" not in text      # RCA-013: nor the new summary labels
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_is_unavailable_when_balances_unauthenticated(monkeypatch):
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="MARGIN", line_available=None, cash_balance=None, excess_equity=None))
+
+    card = await REAL_LIVE_CARD("cash", "kss")
+
+    text = _flex_text(card)
+    assert "อ่านไม่ได้" in text and "/login kss" in text
+    assert "🟢 live" not in text
+    assert "0.00" not in text        # anti-mock: never a fabricated 0.00 balance
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_is_unavailable_when_every_field_unreadable(monkeypatch):
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="CASH", line_available=None, cash_balance=None, excess_equity=None))
+
+    card = await REAL_LIVE_CARD("cash", "kss")
+
+    text = _flex_text(card)
+    assert "อ่านไม่ได้" in text
+    assert "🟢 live" not in text
+
+# --------------------------------------------------------------------------- #
+# RCA-002 — P/L must follow the position side (LONG vs SHORT vs BORROWED)
+# --------------------------------------------------------------------------- #
+def test_normalise_holdings_pnl_follows_side():
+    from app.services.line_cli.handlers import _normalise_holdings
+
+    rows = {r["symbol"]: r for r in _normalise_holdings([
+        {"symbol": "LONGOK", "position_type": "LONG", "volume": 100, "avg_cost": 10.0, "current_price": 11.0},
+        {"symbol": "SHORTOK", "position_type": "SHORT", "volume": 100, "avg_cost": 10.0, "current_price": 9.0},
+        {"symbol": "SHORTLOSS", "position_type": "SHORT", "volume": 100, "avg_cost": 10.0, "current_price": 11.0},
+        {"symbol": "BORROWED", "position_type": "BORROWED", "volume": 100, "avg_cost": 0.0, "current_price": 11.0},
+        {"symbol": "UNKNOWN", "position_type": "UNKNOWN", "volume": 100, "avg_cost": 10.0, "current_price": 11.0},
+    ])}
+
+    assert rows["LONGOK"]["pnl_pct"] == pytest.approx(10.0)
+    assert rows["SHORTOK"]["pnl_pct"] == pytest.approx(10.0)      # price fell → short gains
+    assert rows["SHORTLOSS"]["pnl_pct"] == pytest.approx(-10.0)   # price rose → short loses
+    assert rows["BORROWED"]["pnl_pct"] is None                    # no cost base → "—"
+    assert rows["UNKNOWN"]["pnl_pct"] is None                     # side unreadable → "—"
+
+
+def test_normalise_holdings_defaults_missing_side_to_long():
+    """LIBERATOR ``PositionItem`` has no side field → LONG, never UNKNOWN."""
+    from app.services.line_cli.handlers import _normalise_holdings
+
+    row = _normalise_holdings([{"symbol": "cpall", "volume": 100, "avg_cost": 10.0, "market_price": 12.0}])[0]
+
+    assert row["position_type"] == "LONG"
+    assert row["pnl_pct"] == pytest.approx(20.0)
+
+
+def test_portfolio_totals_prefers_dom_pnl_and_inverts_short_fallback():
+    from app.services.line_cli.handlers import _normalise_holdings, _portfolio_totals
+
+    rows = _normalise_holdings([
+        {"symbol": "A", "position_type": "LONG", "volume": 10, "avg_cost": 10.0, "current_price": 11.0,
+         "unrealized_pnl": 10.0, "market_value": 110.0},
+        {"symbol": "B", "position_type": "SHORT", "volume": 10, "avg_cost": 10.0, "current_price": 12.0,
+         "unrealized_pnl": -20.0, "market_value": 120.0},
+    ])
+    total, pnl = _portfolio_totals(rows)
+    assert total == pytest.approx(230.0)
+    assert pnl == pytest.approx(-10.0)
+
+    fallback = _normalise_holdings([
+        {"symbol": "S", "position_type": "SHORT", "volume": 10, "avg_cost": 10.0, "current_price": 12.0}])
+    total, pnl = _portfolio_totals(fallback)
+    assert total == pytest.approx(120.0)
+    assert pnl == pytest.approx(-20.0)   # short at a loss → negative total
+
+
+def test_port_card_paginates_into_carousel_and_drops_overflow_teaser():
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": f"S{i}", "position_type": "LONG", "volume": 100, "cost": 10.0, "last": 11.0,
+             "pnl_pct": 10.0} for i in range(15)]
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=15000.0,
+                           pnl_value=1500.0, pnl_pct=10.0, rows=rows, snapshot_label="10:00",
+                           stale=False, live=True)
+
+    assert card["contents"]["type"] == "carousel"
+    assert len(card["contents"]["contents"]) == 2      # 12 rows + 3 rows
+    text = _flex_text(card)
+    assert "และอีก" not in text                        # every row is rendered
+    assert "Unrealized P/L" in text
+    assert "P/L วันนี้" not in text
+
+
+def test_port_card_tags_short_side_and_shows_dash_for_unreadable_pnl():
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": "BCPG", "position_type": "SHORT", "volume": 100, "cost": 10.0, "last": 9.0,
+             "pnl_pct": 10.0},
+            {"symbol": "MTC", "position_type": "UNKNOWN", "volume": 100, "cost": 0.0, "last": 9.0,
+             "pnl_pct": None}]
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=1000.0,
+                           pnl_value=100.0, pnl_pct=5.0, rows=rows, snapshot_label="10:00",
+                           stale=False, live=True)
+
+    text = _flex_text(card)
+    assert "BCPG (S)" in text
+    assert "MTC (B)" not in text                       # (B) lives in its own section (D2)
+    assert "—" in text
+    assert card["contents"]["type"] == "bubble"        # a short book stays a single bubble
+
+
+# --------------------------------------------------------------------------- #
+# CLI-RCA-013 — the card header mirrors the app (Amount + Unrealized P/L)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_live_port_card_amount_is_computed_cost_basis(monkeypatch):
+    """RCA-013 (adapted for N0/CDP): KSS Amount = Σ(volume × avg_cost) from the holdings
+    the Streaming scrape returns; the separate on-page totals row no longer exists in the
+    CDP path. Market Value is not rendered (D1)."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(holdings=[
+        {"symbol": "PTT", "volume": 1000, "avg_cost": 34.0, "current_price": 35.0,
+         "position_type": "LONG", "market_value": 35_100.0, "unrealized_pnl": 1_350.0}]))
+
+    card = await REAL_LIVE_CARD("port", "kss")
+
+    text = _flex_text(card)
+    assert "34,000.00" in text                              # cost basis, not a DOM totals row
+    assert "35,100.00" not in text
+    assert "Market Value" not in text
+    assert "🟢 live" in text
+
+
+@pytest.mark.asyncio
+async def test_live_port_card_lib_never_shows_a_borrowed_section(monkeypatch):
+    """Broker isolation: LIB has no (B) loans — the section is KSS-only."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_no="<REDACTED_LIBERATOR_USERNAME>", account_type="CASH_BALANCE", holdings=[
+            {"symbol": "BCH", "volume": 4000, "avg_cost": 20.0, "current_price": 21.0}]))
+
+    card = await REAL_LIVE_CARD("port", "lib")
+
+    text = _flex_text(card)
+    assert "หุ้นยืมคงเหลือ" not in text
+    assert "Unrealized P/L" in text
+
+
+def test_port_card_header_labels_match_the_app():
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": "DOHOME", "position_type": "SHORT", "volume": 100, "cost": 10.0,
+             "last": 9.0, "pnl_pct": 10.0}]
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=1000.0,
+                           pnl_value=100.0, pnl_pct=11.11, rows=rows, snapshot_label="10:00",
+                           stale=False, live=True)
+
+    body = card["contents"]["body"]["contents"]
+    labels = [c["contents"][0]["text"] for c in body
+              if c.get("type") == "box" and c.get("layout") == "horizontal"][:2]
+    assert labels == ["Amount", "Unrealized P/L"]
+    text = _flex_text(card)
+    assert "1,000.00" in text
+    assert "Market Value" not in text and "มูลค่ารวม" not in text
+
+
+def test_port_card_totals_render_dash_when_the_page_exposed_nothing():
+    """Anti-Mock: an unknown Amount renders — , never a fabricated 0.00."""
+    from app.services.line_cli import cards
+
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=None,
+                           pnl_value=-889.59, pnl_pct=-0.17, rows=[], snapshot_label="10:00",
+                           stale=False, live=True)
+
+    body = card["contents"]["body"]["contents"]
+    shown = {c["contents"][0]["text"]: c["contents"][1]["text"] for c in body
+             if c.get("type") == "box" and c.get("layout") == "horizontal"
+             and c["contents"][0]["text"] == "Amount"}
+    assert shown == {"Amount": "—"}
+
+
+def test_port_card_renders_borrowed_section_below_the_pl_line():
+    """D2/D3: (B) rows leave the table and show as ``หุ้นยืมคงเหลือ (B)`` — qty only."""
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": "DOHOME", "position_type": "SHORT", "volume": 2000, "cost": 8.0,
+             "last": 8.5, "pnl_pct": 6.25}]
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=531_932.40,
+                           pnl_value=-889.59, pnl_pct=-0.17, rows=rows,
+                           borrowed=[{"symbol": "MTC", "volume": 1700}],
+                           snapshot_label="10:00", stale=False, live=True)
+
+    body = card["contents"]["body"]["contents"]
+    keys = [c["contents"][0]["text"] for c in body
+            if c.get("type") == "box" and c.get("layout") == "horizontal"]
+    assert keys[:2] == ["Amount", "Unrealized P/L"]   # loans sit right under P/L
+    text = _flex_text(card)
+    assert "หุ้นยืมคงเหลือ (B)" in text
+    assert "1,700 หุ้น · คืนได้ 1,700" in text         # loan qty vs returnable qty
+    assert "/return MTC all" in text                  # every loan is returnable from the card
+    assert text.index("Unrealized P/L") < text.index("MTC") < text.index("DOHOME (S)")
+    assert "Market Value" not in text
+
+
+def test_port_card_omits_borrowed_section_when_there_are_no_loans():
+    """D3: no (B) rows → no ``หุ้นยืมคงเหลือ (B)`` heading (long-only / LIB books)."""
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": "PTT", "position_type": "LONG", "volume": 1000, "cost": 34.0,
+             "last": 35.0, "pnl_pct": 2.94}]
+    card = cards.port_card(broker="LIB", account="CASH", amount=34_000.0, pnl_value=1_000.0,
+                           pnl_pct=2.94, rows=rows, borrowed=[], snapshot_label="10:00",
+                           stale=False, live=True)
+
+    assert "หุ้นยืมคงเหลือ" not in _flex_text(card)
+
+
+def test_money_formats_thb_and_dash():
+    from app.services.line_cli.cards import _money
+
+    assert _money(None) == "—"
+    assert _money(0.0) == "0.00"
+    assert _money(531932.4) == "531,932.40"
+
+
+def test_portfolio_amount_excludes_borrowed_but_totals_include_it():
+    """Amount = Σ vol×avg of non-BORROWED; the page-level total still counts (B)."""
+    from app.services.line_cli.handlers import (
+        _normalise_holdings,
+        _portfolio_amount,
+        _portfolio_totals,
+    )
+
+    rows = _normalise_holdings([
+        {"symbol": "S1", "position_type": "SHORT", "volume": 10, "avg_cost": 10.0, "current_price": 9.0},
+        {"symbol": "S2", "position_type": "SHORT", "volume": 20, "avg_cost": 5.0, "current_price": 6.0},
+        {"symbol": "B1", "position_type": "BORROWED", "volume": 10, "avg_cost": 0.0, "current_price": 7.0},
+    ])
+    assert _portfolio_amount(rows) == pytest.approx(10 * 10.0 + 20 * 5.0)   # (B) excluded
+    total, _ = _portfolio_totals(rows)
+    assert total == pytest.approx(10 * 9.0 + 20 * 6.0 + 10 * 7.0)           # (B) included
+
+
+def test_portfolio_amount_is_none_without_any_cost_base():
+    from app.services.line_cli.handlers import _normalise_holdings, _portfolio_amount
+
+    rows = _normalise_holdings([{"symbol": "B1", "position_type": "BORROWED",
+                                 "volume": 10, "avg_cost": 0.0, "current_price": 7.0}])
+    assert _portfolio_amount(rows) is None
+
+
+def test_split_borrowed_moves_borrowed_out_and_drops_zero_volume():
+    """D2/D3: ``(B)`` rows leave the main table; a zero-volume loan is dropped."""
+    from app.services.line_cli.handlers import _normalise_holdings, _split_borrowed
+
+    rows = _normalise_holdings([
+        {"symbol": "S1", "position_type": "SHORT", "volume": 10, "avg_cost": 10.0, "current_price": 9.0},
+        {"symbol": "S2", "position_type": "SHORT", "volume": 20, "avg_cost": 5.0, "current_price": 6.0},
+        {"symbol": "MTC", "position_type": "BORROWED", "volume": 1700, "avg_cost": 0.0, "current_price": 28.75},
+        {"symbol": "BCPG", "position_type": "BORROWED", "volume": 0, "avg_cost": 0.0, "current_price": 0.0},
+    ])
+    main, borrowed = _split_borrowed(rows)
+
+    assert [r["symbol"] for r in main] == ["S2", "S1"]      # (B) gone, vol×last order kept
+    # BCPG (0 shares, no loan on the book) is still dropped; the surviving loan now
+    # carries the ledger fields the card needs (borrow vs returnable).
+    assert [b["symbol"] for b in borrowed] == ["MTC"]
+    assert borrowed[0]["volume"] == 1700 and borrowed[0]["broker"] == "kss"
+    assert borrowed[0]["borrow_qty"] == 0 and borrowed[0]["returnable_qty"] == 0
+
+
+def test_split_borrowed_is_empty_without_borrowed_rows():
+    """LIB / long-only books: nothing is moved out, no ``(B)`` section."""
+    from app.services.line_cli.handlers import _normalise_holdings, _split_borrowed
+
+    rows = _normalise_holdings([{"symbol": "PTT", "volume": 1000, "avg_cost": 34.0,
+                                 "current_price": 35.0}])
+    main, borrowed = _split_borrowed(rows)
+
+    assert [r["symbol"] for r in main] == ["PTT"]
+    assert borrowed == []
+
+
+def test_split_borrowed_hides_card_when_short_order_active():
+    """Anti-confusion: When a borrowed lot has an active Queuing SHORT order, hide the (B) card."""
+    from app.services.line_cli.handlers import _normalise_holdings, _split_borrowed
+
+    rows = _normalise_holdings([
+        {"symbol": "BTS", "position_type": "BORROWED", "volume": 41200, "available_volume": 41200, "avg_cost": 0.0, "current_price": 1.81},
+        {"symbol": "BCPG", "position_type": "BORROWED", "volume": 100, "available_volume": 100, "avg_cost": 0.0, "current_price": 8.0},
+    ])
+    # Active SHORT on BTS
+    main, borrowed = _split_borrowed(rows, active_short_symbols={"BTS"})
+    # BTS is hidden from borrowed cards, only unshorted BCPG remains
+    assert [b["symbol"] for b in borrowed] == ["BCPG"]
+
+
+def test_split_borrowed_hides_card_when_available_volume_is_zero():
+    """Anti-confusion: When available_volume is 0 (shares locked/exhausted), hide the (B) card."""
+    from app.services.line_cli.handlers import _normalise_holdings, _split_borrowed
+
+    rows = _normalise_holdings([
+        {"symbol": "AAV", "position_type": "BORROWED", "volume": 94900, "available_volume": 0, "avg_cost": 0.0, "current_price": 0.78},
+        {"symbol": "BCPG", "position_type": "BORROWED", "volume": 100, "available_volume": 100, "avg_cost": 0.0, "current_price": 8.0},
+    ])
+    main, borrowed = _split_borrowed(rows)
+    # AAV has avail_vol == 0 -> hidden; BCPG has avail_vol == 100 -> kept
+    assert [b["symbol"] for b in borrowed] == ["BCPG"]
+
+
+def test_unified_orders_manage_cards_short_buttons():
+    """Unified Order card for SHORT has Lure and Cancel buttons (no Match due to Uptick)."""
+    from app.services.line_cli import cards
+
+    orders = [{
+        "order_no": "11014765", "symbol": "BTS", "side": "SHORT", "price": 1.82,
+        "volume": 41200, "balance": 41200, "status": "Queuing(O)", "kind": "open",
+        "cancellable": True, "broker": "kss",
+    }]
+    msgs = cards.orders_manage_cards(broker="kss", orders=orders, snapshot_label="16:50")
+    assert len(msgs) == 1
+    bubble = msgs[0]["contents"]["contents"][0]
+    # SHORT has 1 row with 2 buttons in footer
+    footer = bubble.get("footer")
+    assert footer is not None
+    contents = footer.get("contents") or []
+    labels = [b.get("action", {}).get("label") for b in contents]
+    assert any("ล่อ" in lbl for lbl in labels)
+    assert any("ยกเลิก" in lbl for lbl in labels)
+    assert not any("Match" in lbl for lbl in labels)
+
+
+def test_unified_orders_manage_cards_buy_buttons():
+    """Unified Order card for BUY/SELL has 2 rows: [Match] [Lure] on top, [Cancel] on bottom."""
+    from app.services.line_cli import cards
+
+    orders = [{
+        "order_no": "22019999", "symbol": "PTT", "side": "BUY", "price": 34.0,
+        "volume": 1000, "balance": 1000, "status": "Queuing(O)", "kind": "open",
+        "cancellable": True, "broker": "lib",
+    }]
+    msgs = cards.orders_manage_cards(broker="lib", orders=orders, snapshot_label="16:50")
+    assert len(msgs) == 1
+    bubble = msgs[0]["contents"]["contents"][0]
+    footer = bubble.get("footer")
+    assert footer is not None
+    rows = footer.get("contents") or []
+    assert len(rows) == 2
+    row_top = rows[0].get("contents") or []
+    row_bottom = rows[1].get("contents") or []
+    top_labels = [b.get("action", {}).get("label") for b in row_top]
+    bottom_labels = [b.get("action", {}).get("label") for b in row_bottom]
+    assert any("Match" in lbl for lbl in top_labels)
+    assert any("ล่อ" in lbl for lbl in top_labels)
+    assert any("ยกเลิก" in lbl for lbl in bottom_labels)
+
+
+def test_unified_orders_manage_cards_empty():
+    """When no resting orders, orders_manage_cards returns empty card."""
+    from app.services.line_cli import cards
+
+    orders = [{
+        "order_no": "11010970", "symbol": "CHG", "side": "SHORT", "price": 1.56,
+        "volume": 47700, "balance": 0, "status": "Matched(M)", "kind": "matched",
+        "cancellable": False, "broker": "kss",
+    }]
+    msgs = cards.orders_manage_cards(broker="kss", orders=orders, snapshot_label="16:50")
+    assert len(msgs) == 1
+    alt = msgs[0].get("altText", "")
+    assert "ไม่มีออเดอร์ค้าง" in alt
+
+
+def test_normalise_holdings_drops_zero_volume_non_borrowed():
+    """Verify non-BORROWED zero-volume holdings (e.g. Liberator sold position HUMAN) are dropped."""
+    from app.services.line_cli.handlers import (
+        _normalise_holdings,
+        _portfolio_amount,
+        _portfolio_totals,
+    )
+
+    raw_holdings = [
+        {"symbol": "BCPG", "volume": 7400, "avg_cost": 6.75, "current_price": 7.0},
+        {"symbol": "HUMAN", "volume": 0, "avg_cost": 10.0, "current_price": 9.5},
+        {"symbol": "MRDIYT", "volume": 5800, "avg_cost": 8.55, "current_price": 8.6},
+        {"symbol": "ZERO_NEG", "volume": -10, "avg_cost": 5.0, "current_price": 5.0},
+    ]
+    rows = _normalise_holdings(raw_holdings)
+    symbols = [r["symbol"] for r in rows]
+    assert symbols == ["BCPG", "MRDIYT"]
+    assert "HUMAN" not in symbols
+    assert "ZERO_NEG" not in symbols
+
+    # Assert _portfolio_amount and _portfolio_totals ignore the zero-volume rows
+    expected_amount = 7400 * 6.75 + 5800 * 8.55
+    expected_total = 7400 * 7.0 + 5800 * 8.6
+    assert _portfolio_amount(rows) == pytest.approx(expected_amount)
+    total, _ = _portfolio_totals(rows)
+    assert total == pytest.approx(expected_total)
+
+
+def test_port_card_keeps_long_symbol_with_suffix_unclipped():
+    """RCA-012: a long symbol + its side suffix stay in one wrapping text node."""
+    from app.services.line_cli import cards
+
+    rows = [{"symbol": "DOHOME", "position_type": "SHORT", "volume": 2000, "cost": 8.0,
+             "last": 8.5, "pnl_pct": 6.25}]
+    card = cards.port_card(broker="KSS", account="<REDACTED_KSS_ACCT>", amount=16_000.0,
+                           pnl_value=1_000.0, pnl_pct=6.25, rows=rows,
+                           snapshot_label="10:00", stale=False, live=True)
+
+    body = card["contents"]["body"]["contents"]
+    boxes = []
+    for c in body:
+        if c.get("type") == "box":
+            if c.get("layout") == "horizontal":
+                boxes.append(c)
+            elif c.get("layout") == "vertical" and c.get("contents"):
+                for inner in c["contents"]:
+                    if inner.get("type") == "box" and inner.get("layout") == "horizontal":
+                        boxes.append(inner)
+    header_row = next(c for c in boxes if c["contents"][0].get("text") == "หุ้น")
+    symbol_cell = next(c for c in boxes if c["contents"][0].get("text") == "DOHOME (S)")
+
+    assert header_row["contents"][0]["flex"] == 4        # symbol gets the room
+    assert header_row["contents"][1]["flex"] == 2        # qty column yields it
+    assert symbol_cell["contents"][0]["wrap"] is True    # wraps instead of clipping
+    assert symbol_cell["contents"][0]["flex"] == 4
+    assert symbol_cell["contents"][1]["flex"] == 2
+    assert symbol_cell["contents"][0]["size"] == "xs"    # numbers/labels not shrunk
+
+
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_lib_uses_liberator_balances(monkeypatch):
+    """RCA-007 regression at the CLI layer: /cash lib asks LIBERATOR, never Click2Win.
+
+    Also covers the raw-enum leak: LIBERATOR reports ``account_type="CASH_BALANCE"``,
+    which must render as a human label — never the raw code.
+    """
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_no="<REDACTED_LIBERATOR_USERNAME>", account_type="CASH_BALANCE", cash_balance=<REDACTED_KRUNGSRI_PIN>.78,
+        line_available=200000.0, excess_equity=100000.0))
+
+    card = await REAL_LIVE_CARD("cash", "lib")
+
+    text = _flex_text(card)
+    assert "LIB" in text
+    assert "123,456.78" in text
+    assert "🟢 live" in text
+    assert "อ่านไม่ได้" not in text
+    assert "Cash Balance" in text          # human label in the card header
+    assert "CASH_BALANCE" not in text      # raw enum never leaks to LINE
+
+
+def test_account_type_label_maps_raw_codes():
+    from app.services.line_cli.handlers import _account_type_label
+
+    assert _account_type_label("CASH_BALANCE") == "Cash Balance"
+    assert _account_type_label("margin") == "Margin"
+    assert _account_type_label(None) == "CASH"
+    assert _account_type_label("WEIRD_CODE") == "WEIRD_CODE"   # unknown → pass through honestly
+
+
+# --------------------------------------------------------------------------- #
+# CLI-RCA-011 (P2a) — /cash kss binds each figure to the account read off the dropdown
+# --------------------------------------------------------------------------- #
+def _kss_balances(account_type, *, values_bound=True, line_available=None,
+                  cash_balance=None, excess_equity=None, authenticated=True):
+    """``portfolio_get_balances()`` payload for one bound (or unbound) KSS account."""
+    return {
+        "platform": "KRUNGSRI", "authenticated": authenticated,
+        "scraped_account_no": "<REDACTED_KSS_ACCT>" if values_bound else None,
+        "accounts": [{"account_type": account_type, "values_bound": values_bound,
+                      "line_available": line_available, "cash_balance": cash_balance,
+                      "excess_equity": excess_equity, "is_active": True}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_margin_shows_ee_or_dash(monkeypatch):
+    """(a) MARGIN bound + EE unreadable -> ``Excess Equity`` with ``—``; header is Margin and
+    the old ``Cash balance`` / ``Buying power`` rows are gone (CLI-RCA-011 D3)."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="MARGIN", line_available=250_000.0, excess_equity=None))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "Line Available" in text and "250,000.00" in text
+    assert "Excess Equity" in text and "—" in text
+    assert "Margin" in text
+    assert "Buying power" not in text
+    assert "Cash balance" not in text
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_margin_shows_ee_value_when_readable(monkeypatch):
+    """(a cont.) a readable EE renders as a figure, not the ``—`` placeholder."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="MARGIN", line_available=250_000.0, excess_equity=900_000.0))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "Excess Equity" in text and "900,000.00" in text
+    assert "—" not in text
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_cash_has_no_ee_row(monkeypatch):
+    """(c) CASH bound -> a single Line Available row, never an Excess Equity row."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="CASH", line_available=42_000.0))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "42,000.00" in text
+    assert "Excess Equity" not in text
+    assert "Margin" not in text
+    assert "Cash balance" not in text      # P2b: the CASH account exposes no such row
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_margin_shows_cash_balance_when_readable(monkeypatch):
+    """CLI-RCA-011 (P2b): a readable Account Info "Cash Balance" gets its own row.
+
+    It must be a distinct figure from Line Available (PP) — conflating the two was the
+    original CLI-RCA-011 bug.
+    """
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="MARGIN", line_available=250_000.0, cash_balance=88_000.0,
+        excess_equity=900_000.0))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "Line Available" in text and "250,000.00" in text
+    assert "Excess Equity" in text and "900,000.00" in text
+    assert "Cash balance" in text and "88,000.00" in text
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_omits_cash_balance_when_unreadable(monkeypatch):
+    """CLI-RCA-011 (P2b): no "Cash balance" row unless the driver read a value (Anti-Mock)."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_type="CASH", line_available=42_000.0, cash_balance=None))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "Line Available" in text and "42,000.00" in text
+    assert "Cash balance" not in text
+
+
+@pytest.mark.asyncio
+async def test_live_cash_card_kss_unbound_account_is_unavailable(monkeypatch):
+    """(b) a scrape that cannot read the account fails closed -> ``อ่านไม่ได้``, never 🟢 live.
+
+    In the CDP path there is no "unbound" flag: ``_scrape_kss`` raises when the account_no
+    header is unreadable, which ``_live_card`` turns into the honest unavailable card.
+    """
+    _patch_cdp_portfolio(monkeypatch, exc=RuntimeError(
+        "KSS Streaming: could not read active account_no from the header"))
+
+    text = _flex_text(await REAL_LIVE_CARD("cash", "kss"))
+
+    assert "อ่านไม่ได้" in text and "/login kss" in text
+    assert "🟢 live" not in text
+    assert "Line Available" not in text
+
+
+
+
+# --------------------------------------------------------------------------- #
+# /negotiate — alias of /nego kss (ONE path, TASK-loop1-2 D1/D2)
+# --------------------------------------------------------------------------- #
+def _patch_live_kss(monkeypatch, result, *, order=None, price=34.00, bid_1=34.20):
+    """Wire the LIVE kss seam: ledger order in, Quick Trade service result out."""
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(
+        return_value=[order or _open_order(order_no="11008198", price=price)]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=bid_1)))
+    res = dict(result)
+    res.setdefault("path", "QUICKTRADE_INPLACE")
+    monkeypatch.setattr(handlers, "_broker_modify", AsyncMock(return_value=res))
+    return res
+
+
+@pytest.mark.asyncio
+async def test_negotiate_requires_an_order_no(service, db_session):
+    res = await _run(service, '/negotiate', db=db_session)
+    assert res['status'] == 'CLI_NEGOTIATE_BAD_ARGS'
+    assert 'รูปแบบ' in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_negotiate_kill_switch_blocks(service, db_session, monkeypatch):
+    from app.services.kill_switch_service import kill_switch_service
+    monkeypatch.setattr(kill_switch_service, 'is_active', lambda: True)
+    res = await _run(service, '/negotiate 11008198', db=db_session)
+    assert res['status'] == 'CLI_KILL_SWITCH'
+    assert 'KILL-SWITCH' in service.last_text()
+
+
+@pytest.mark.asyncio
+async def test_negotiate_out_of_hours_blocks(service, db_session, monkeypatch):
+    monkeypatch.setattr(handlers, '_in_nego_window', lambda now=None: False)
+    res = await _run(service, '/negotiate 11008198', db=db_session)
+    assert res['status'] == 'CLI_OUT_OF_HOURS'
+
+
+@pytest.mark.asyncio
+async def test_negotiate_amends_in_place_and_pushes_card(service, db_session, monkeypatch):
+    """The alias runs the unified /nego kss flow (ledger -> Quick Trade in-place)."""
+    from app.db.models import SessionLog
+    from sqlalchemy import select
+    _patch_live_kss(monkeypatch, {
+        'success': True, 'outcome': 'OK', 'submitted': True,
+        'current_price': 34.00, 'target_price': 34.20,
+    })
+
+    res = await _run(service, '/negotiate 11008198', db=db_session)
+    assert res['status'] == 'CLI_NEGO' and res['order_no'] == '11008198'
+    assert res['ok'] == 1 and res['failed'] == 0 and res['skipped'] == 0
+    handlers._broker_open_orders.assert_awaited_once_with('kss')     # one path only
+    handlers._broker_modify.assert_awaited_once()
+    card, target = service.pushes[-1]
+    assert card['type'] == 'flex' and 'ต่อราคา #11008198' in card['altText']
+    assert target == 'U_OP'
+    logs = (await db_session.execute(
+        select(SessionLog).where(SessionLog.event_type == 'LINE_CLI_NEGO'))).scalars().all()
+    assert any('11008198' in (l.details or '') for l in logs)
+
+
+@pytest.mark.asyncio
+async def test_negotiate_uptick_violation_is_shown_as_failure(service, db_session, monkeypatch):
+    """The live quote ticked down between preview and amend -> skip, never an ok."""
+    _patch_live_kss(monkeypatch, {
+        'success': False, 'outcome': 'UPTICK_VIOLATION', 'submitted': False,
+        'current_price': 34.00, 'target_price': None,
+        'reason': 'offer_1 33.90 < last 34.00', 'error': 'offer_1 33.90 < last 34.00',
+    }, order=_open_order(order_no="11008198", side="SHORT", price=34.00))
+    monkeypatch.setattr(handlers, "_broker_quote",
+                        AsyncMock(return_value=_quote(offer_1=34.20, last=34.00)))
+
+    res = await _run(service, '/negotiate 11008198', db=db_session)
+    assert res['ok'] == 0 and res['skipped'] == 1 and res['failed'] == 0
+    card = service.pushes[-1][0]
+    assert card['type'] == 'flex' and 'ผิดกฎ Uptick' in card['altText']
+
+
+@pytest.mark.asyncio
+async def test_negotiate_dry_run_card_never_claims_a_live_submission(service, db_session, monkeypatch):
+    """Anti-Mock: a staged DRY-RUN amendment must read `จัดเตรียมไว้`, never `ส่งเข้าตลาดแล้ว`.
+
+    `submitted` is deliberately absent at the top level — the handler must read it from
+    `amendment`, and the card must never infer a live submission from `success`.
+    """
+    _patch_live_kss(monkeypatch, {
+        'success': True, 'outcome': 'OK', 'submitted': False, 'dry_run': True,
+        'current_price': 34.00, 'target_price': 34.20,
+    })
+
+    res = await _run(service, '/negotiate 11008198', db=db_session)
+    assert res['status'] == 'CLI_NEGO' and res['ok'] == 1
+    card = service.pushes[-1][0]
+    assert 'จัดเตรียมไว้ (TEST/DRY-RUN)' in str(card)
+    assert 'ส่งเข้าตลาดแล้ว' not in str(card)
+
+
+
+# --------------------------------------------------------------------------- #
+# TASK-loop1-1 · Pillar 2 orders/port honesty (A3 · C2 · C4 · CLI-RCA-004)
+# --------------------------------------------------------------------------- #
+def _find_inner_row(node, needle):
+    """Innermost vertical ``box`` whose FIRST content is the text cell containing ``needle``."""
+    if isinstance(node, dict):
+        contents = node.get("contents")
+        if (node.get("type") == "box" and node.get("layout") == "vertical"
+                and isinstance(contents, list) and contents
+                and isinstance(contents[0], dict) and contents[0].get("type") == "text"
+                and needle in str(contents[0].get("text", ""))):
+            return node
+        for value in node.values():
+            found = _find_inner_row(value, needle)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_inner_row(value, needle)
+            if found:
+                return found
+    return None
+
+
+@pytest.mark.asyncio
+async def test_live_orders_card_is_unavailable_when_not_authenticated(monkeypatch):
+    """TASK-loop1-1 (Anti-Mock): when the CDP ledger scrape fails, the orders card must say
+    อ่านไม่ได้ — never an empty ledger under a 🟢 live badge."""
+    _patch_cdp_orders(monkeypatch, exc=RuntimeError("no authenticated tab"))
+
+    card = await REAL_LIVE_CARD("orders", "kss")
+
+    text = _flex_text(card)
+    assert "อ่านไม่ได้" in text and "/login kss" in text
+    assert "🟢 live" not in text
+
+
+@pytest.mark.asyncio
+async def test_live_orders_card_row_is_two_lines_with_md_symbol(monkeypatch):
+    """CLI-RCA-004: each order is its own 2-line block — symbol on line 1 in bold ``md`` (no
+    clipping on a phone screen), volume/price + status on line 2."""
+    _patch_cdp_orders(monkeypatch, orders=[{
+        "broker_order_no": "1", "symbol": "SAWAD", "side": "Buy", "volume": 100,
+        "matched_volume": 0, "balance": 100, "price": 22.5, "status": "Queuing(O)",
+    }])
+
+    card = await REAL_LIVE_CARD("orders", "kss")
+
+    text = _flex_text(card)
+    assert "SAWAD" in text and "🟢 live" in text
+    row = _find_inner_row(card, "SAWAD")
+    assert row is not None, "each order must be its own vertical (2-line) box"
+    symbol_cell = row["contents"][0]
+    assert symbol_cell["size"] == "md" and symbol_cell["weight"] == "bold"
+    assert row["contents"][1]["layout"] == "horizontal"
+
+
+@pytest.mark.asyncio
+async def test_live_port_card_lib_shows_real_account_no(monkeypatch):
+    """C2 (TASK-loop1-1): `/port lib sync` shows the account number read off the screen instead
+    of the generic "LIVE" placeholder."""
+    _patch_cdp_portfolio(monkeypatch, _cdp_portfolio_snap(
+        account_no="1234567", account_type="CASH_BALANCE", holdings=[]))
+
+    card = await REAL_LIVE_CARD("port", "lib")
+
+    assert "1234567" in _flex_text(card)
+
+
+
+# --------------------------------------------------------------------------- #
+# Loop 1 D3 — the LIB broker edges (fail-closed quote + symbol gate)
+# --------------------------------------------------------------------------- #
+def _lib_quote(**over):
+    """A real Liberator board reading (the shape ``get_market_bid_offer`` returns now)."""
+    quote = {"success": True, "status": "OK", "symbol": "BCH", "source": "liberator_api",
+             "bid_1": 11.60, "offer_1": 11.70, "last": 11.65}
+    quote.update(over)
+    return quote
+
+
+def _quote_unavailable(symbol="BCH", error="no active Liberator page (session not open)"):
+    """The driver's explicit fail-closed envelope — NOT a quote."""
+    return {"success": False, "status": "QUOTE_UNAVAILABLE", "symbol": symbol,
+            "source": "unavailable", "bid_1": None, "offer_1": None, "last": None,
+            "error": error}
+
+
+def _patch_lib_change_order(monkeypatch, result=None):
+    import app.brokers as brokers_pkg
+    spy = AsyncMock(return_value=result or {"success": True, "action": "AMENDED_IN_PLACE"})
+    monkeypatch.setattr(brokers_pkg.liberator_plugin, "change_order", spy)
+    return spy
+
+
+def _live_mode():
+    from unittest.mock import PropertyMock, patch
+    from app.services.trade_dispatcher import trade_dispatcher
+    return patch.object(type(trade_dispatcher), "is_live", new_callable=PropertyMock, return_value=True)
+
+
+@pytest.mark.asyncio
+async def test_broker_modify_lib_live_fails_closed_when_the_quote_dies(monkeypatch):
+    """Anti-Mock: an unreadable board aborts the amend — the driver is never called."""
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote_unavailable()))
+    spy = _patch_lib_change_order(monkeypatch)
+
+    with _live_mode():
+        res = await REAL_BROKER_MODIFY('lib', order_no='11894', new_price=11.70,
+                                       symbol='BCH', side='SELL', volume=4000)
+
+    assert res['success'] is False
+    assert res['status'] == 'QUOTE_UNAVAILABLE'
+    assert res['unavailable'] is True
+    spy.assert_not_awaited()                     # nothing was pressed on the broker
+
+
+@pytest.mark.asyncio
+async def test_broker_modify_lib_live_fails_closed_when_the_quote_is_another_symbol(monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_lib_quote(symbol='PTT')))
+    spy = _patch_lib_change_order(monkeypatch)
+
+    with _live_mode():
+        res = await REAL_BROKER_MODIFY('lib', order_no='11894', new_price=11.70,
+                                       symbol='BCH', side='SELL', volume=4000)
+
+    assert res['success'] is False and res['status'] == 'QUOTE_UNAVAILABLE'
+    assert 'PTT' in res['error'] and 'BCH' in res['error']
+    spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_broker_modify_lib_live_fails_closed_when_the_needed_side_is_empty(monkeypatch):
+    """A BUY/Cover needs Bid1: an empty side is no price basis → fail-closed."""
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_lib_quote(bid_1=None)))
+    spy = _patch_lib_change_order(monkeypatch)
+
+    with _live_mode():
+        res = await REAL_BROKER_MODIFY('lib', order_no='11894', new_price=11.70,
+                                       symbol='BCH', side='BUY', volume=4000)
+
+    assert res['success'] is False and res['status'] == 'QUOTE_UNAVAILABLE'
+    assert 'bid_1' in res['error']
+    spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_broker_modify_lib_live_passes_the_symbol_for_positive_identification(monkeypatch):
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_lib_quote()))
+    spy = _patch_lib_change_order(monkeypatch)
+
+    with _live_mode():
+        res = await REAL_BROKER_MODIFY('lib', order_no='11894', new_price=11.70,
+                                       symbol='BCH', side='SELL', volume=4000)
+
+    assert res['success'] is True
+    spy.assert_awaited_once()
+    assert spy.await_args.kwargs == {'order_no': '11894', 'new_price': 11.70, 'symbol': 'BCH'}
+
+
+@pytest.mark.asyncio
+async def test_nego_lib_halts_and_shows_the_unavailable_card_when_the_quote_dies(
+        service, db_session, monkeypatch):
+    """Fail-closed: no price basis ⇒ stop the batch and show the honest read-failure card."""
+    orders = [_open_order(order_no='1', symbol='BCH'), _open_order(order_no='2', symbol='PTT')]
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=orders))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_quote(bid_1=34.20, offer_1=34.30)))
+    monkeypatch.setattr(handlers, '_broker_modify', AsyncMock(return_value={
+        'success': False, 'status': 'QUOTE_UNAVAILABLE', 'unavailable': True,
+        'error': 'อ่านราคา BCH จาก Liberator ไม่ได้'}))
+
+    res = await _run(service, '/nego lib', db=db_session)
+
+    assert res['halted'] is True and res['halt_status'] == 'QUOTE_UNAVAILABLE'
+    assert res['ok'] == 0 and res['failed'] == 1
+    handlers._broker_modify.assert_awaited_once()            # the batch stopped after the halt
+    card = service.pushes[-1][0]
+    assert 'อ่านข้อมูลไม่ได้' in card['altText']              # honest read-failure card
+    assert 'ผลต่อราคา' not in card['altText']                # never a "normal" per-order summary
+
+
+@pytest.mark.asyncio
+async def test_nego_lib_halts_when_the_order_identity_is_unproven(service, db_session, monkeypatch):
+    """SYMBOL_MISMATCH from the driver also halts the batch (never amend the wrong stock)."""
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=[_open_order(order_no='1')]))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_quote(bid_1=34.20, offer_1=34.30)))
+    monkeypatch.setattr(handlers, '_broker_modify', AsyncMock(return_value={
+        'success': False, 'status': 'SYMBOL_MISMATCH', 'error': 'row is PTT, not BCH'}))
+
+    res = await _run(service, '/nego lib', db=db_session)
+
+    assert res['halted'] is True and res['halt_status'] == 'SYMBOL_MISMATCH'
+    assert 'อ่านข้อมูลไม่ได้' in service.pushes[-1][0]['altText']
+
+
+@pytest.mark.asyncio
+async def test_nego_lib_batch_reports_normally_when_quotes_are_readable(service, db_session, monkeypatch):
+    """The halt is an exception path — a readable batch still shows the per-order summary."""
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=[
+        _open_order(order_no='11894', symbol='BCH', side='SELL', price=11.80)]))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_lib_quote()))
+    monkeypatch.setattr(handlers, '_broker_modify', AsyncMock(return_value={'success': True}))
+
+    res = await _run(service, '/nego lib', db=db_session)
+
+    assert res['halted'] is False and res['ok'] == 1 and res['failed'] == 0
+    assert 'ผลต่อราคา' in service.pushes[-1][0]['altText']
+
+
+@pytest.mark.asyncio
+async def test_plan_nego_skips_on_the_explicit_quote_unavailable_envelope(monkeypatch):
+    """The new LIB envelope (success=False, no ``source`` marker needed) also fails closed."""
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value={
+        'success': False, 'status': 'QUOTE_UNAVAILABLE', 'symbol': 'BCH',
+        'bid_1': None, 'offer_1': None, 'last': None}))
+
+    row = await handlers._plan_nego('lib', _open_order(symbol='BCH', side='SELL'), 3)
+
+    assert row['status'] == 'skip' and 'fail-closed' in row['reason']
+
+
+
+# --------------------------------------------------------------------------- #
+# Loop 1 D3 — `/nego lib` end-to-end: target filter + G5 tick distance
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_nego_lib_symbol_filter_amends_only_that_symbol(service, db_session, monkeypatch):
+    """`/nego lib BCH` amends the BCH order only — a PTT row is never touched."""
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=[
+        _open_order(order_no='11894', symbol='BCH', side='SELL', price=11.80),
+        _open_order(order_no='22222', symbol='PTT', side='SELL', price=11.80)]))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_lib_quote()))
+    spy = AsyncMock(return_value={'success': True})
+    monkeypatch.setattr(handlers, '_broker_modify', spy)
+
+    res = await _run(service, '/nego lib BCH', db=db_session)
+
+    assert res['status'] == 'CLI_NEGO'
+    assert res['ok'] == 1 and res['skipped'] == 0 and res['failed'] == 0
+    spy.assert_awaited_once()                                   # PTT was filtered out
+    assert spy.await_args.kwargs['symbol'] == 'BCH'
+    assert spy.await_args.kwargs['order_no'] == '11894'
+    assert 'ผลต่อราคา' in service.pushes[-1][0]['altText']
+
+
+@pytest.mark.asyncio
+async def test_nego_lib_order_no_filter_amends_only_that_order(service, db_session, monkeypatch):
+    """`/nego lib 11894` amends exactly that order and pushes the focused one-order card."""
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=[
+        _open_order(order_no='11894', symbol='BCH', side='SELL', price=11.80),
+        _open_order(order_no='22222', symbol='PTT', side='SELL', price=11.80)]))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_lib_quote()))
+    spy = AsyncMock(return_value={'success': True})
+    monkeypatch.setattr(handlers, '_broker_modify', spy)
+
+    res = await _run(service, '/nego lib 11894', db=db_session)
+
+    assert res['ok'] == 1 and res['failed'] == 0
+    spy.assert_awaited_once()
+    assert spy.await_args.kwargs['order_no'] == '11894'
+    text = _flex_text(service.pushes[-1][0])
+    assert '#11894' in text and 'BCH' in text                   # the focused card (D2)
+
+
+@pytest.mark.asyncio
+async def test_nego_lib_skips_when_the_target_is_more_than_three_ticks_away(
+        service, db_session, monkeypatch):
+    """G5 on LIB: a Bid/Offer far from the order price is a skip, never a forced amend."""
+    monkeypatch.setattr(handlers, '_broker_open_orders', AsyncMock(return_value=[
+        _open_order(order_no='11894', symbol='BCH', side='SELL', price=30.00, balance=100)]))
+    monkeypatch.setattr(handlers, '_broker_quote', AsyncMock(return_value=_lib_quote()))
+    spy = AsyncMock(return_value={'success': True})
+    monkeypatch.setattr(handlers, '_broker_modify', spy)
+
+    res = await _run(service, '/nego lib', db=db_session)
+
+    assert res['ok'] == 0 and res['skipped'] == 1 and res['halted'] is False
+    spy.assert_not_awaited()                                    # nothing was pressed
+    assert "ticks away from" in _flex_text(service.pushes[-1][0])
+
+
+@pytest.mark.asyncio
+async def test_nego_card_shows_dry_run_badge(service, db_session, monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "DRY_RUN_MODE", True)
+    monkeypatch.setattr(handlers, "_broker_open_orders", AsyncMock(return_value=[_open_order()]))
+    monkeypatch.setattr(handlers, "_broker_quote", AsyncMock(return_value=_quote(bid_1=34.20, offer_1=34.30, last=34.00)))
+    monkeypatch.setattr(handlers, "_broker_modify", AsyncMock(return_value={"success": True}))
+
+    await _run(service, "/nego kss", db=db_session)
+    card_text = _flex_text(service.pushes[-1][0])
+    assert "DRY-RUN" in card_text
+    assert "#facc15" in card_text
+
+
+@pytest.mark.asyncio
+async def test_negotiate_card_shows_dry_run_badge(service, db_session, monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "DRY_RUN_MODE", True)
+    _patch_live_kss(monkeypatch, {
+        'success': True, 'outcome': 'OK', 'submitted': False, 'dry_run': True,
+        'current_price': 34.00, 'target_price': 34.20,
+    })
+
+    await _run(service, '/negotiate 11008198', db=db_session)
+    card_text = _flex_text(service.pushes[-1][0])
+    assert "DRY-RUN" in card_text
+    assert "#facc15" in card_text
+

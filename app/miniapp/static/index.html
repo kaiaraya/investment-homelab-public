@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#06090e">
+  <title>Investment Homelab MiniApp</title>
+  <link rel="stylesheet" href="/miniapp/static/css/app.css">
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js" defer></script>
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="top-bar">
+      <div class="brand">
+        <span class="brand-dot" id="gateway-dot"></span>
+        <span class="brand-title">Homelab</span>
+        <span id="mode-badge" class="pill pill-amber">DRY-RUN</span>
+      </div>
+      <div class="top-actions">
+        <button id="top-kss-pill" class="pill-btn pill-muted" data-jump-tab="brokers" type="button">KSS -</button>
+        <button id="top-lib-pill" class="pill-btn pill-muted" data-jump-tab="brokers" type="button">LIB -</button>
+        <button id="top-quota-pill" class="pill-btn pill-sky quota-pill" title="LINE Monthly Quota &amp; EOD 17:05" type="button">EOD ?/300</button>
+        <button id="top-inbox-btn" class="icon-btn inbox-btn" title="Notification Inbox" type="button" aria-label="Notification Inbox">
+          <span>🔔</span>
+          <span id="top-inbox-badge" class="inbox-badge hidden">0</span>
+        </button>
+        <button id="top-kill-btn" class="icon-btn" title="Kill-Switch" type="button">🛡️</button>
+      </div>
+    </header>
+
+    <div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+    <div id="sticky-otp-banner" class="sticky-otp-banner hidden" role="region" aria-label="Pending 2FA OTP"></div>
+
+    <div id="last-result-banner" class="result-banner hidden" role="status" aria-live="polite"></div>
+
+    <main id="main-content" class="main-scroll">
+      <div class="card skeleton-card">
+        <div class="muted">กำลังเชื่อมต่อ LIFF &amp; Homelab Gateway...</div>
+      </div>
+    </main>
+
+    <footer id="app-footer" class="app-footer">
+      <span id="app-version-label">MiniApp vdev</span>
+    </footer>
+
+    <nav class="bottom-nav" aria-label="Primary Navigation">
+      <button class="tab-btn" data-tab="portfolio" type="button">
+        <span class="tab-icon">📊</span>
+        <span class="tab-label">Port</span>
+      </button>
+      <button class="tab-btn" data-tab="orders" type="button">
+        <span class="tab-icon">📋</span>
+        <span class="tab-label">Orders</span>
+      </button>
+      <button class="tab-btn" data-tab="nego" type="button">
+        <span class="tab-icon">⏱️</span>
+        <span class="tab-label">Schedule</span>
+      </button>
+      <button class="tab-btn" data-tab="trade" type="button">
+        <span class="tab-icon">💹</span>
+        <span class="tab-label">Trade</span>
+      </button>
+      <button class="tab-btn active" data-tab="brokers" type="button">
+        <span class="tab-icon">🏦</span>
+        <span class="tab-label">Brokers</span>
+      </button>
+    </nav>
+  </div>
+
+  <div id="sheet-backdrop" class="sheet-backdrop hidden" role="dialog" aria-modal="true">
+    <div id="sheet-panel" class="sheet-panel">
+      <div class="sheet-handle"></div>
+      <h3 id="sheet-title" class="sheet-title">ยืนยันรายการ</h3>
+      <div id="sheet-body" class="sheet-body"></div>
+      <div class="sheet-actions" id="sheet-actions">
+        <button id="sheet-cancel" class="btn btn-ghost" type="button">ยกเลิก</button>
+        <button id="sheet-confirm" class="btn btn-primary" type="button">ยืนยัน</button>
+      </div>
+      <div class="sheet-actions hidden" id="sheet-result-ctas"></div>
+    </div>
+  </div>
+
+  <div id="inbox-drawer" class="inbox-drawer-backdrop hidden" role="dialog" aria-modal="true" aria-label="Notification Inbox">
+    <div class="inbox-drawer-panel">
+      <div class="sheet-handle"></div>
+      <div class="inbox-drawer-head">
+        <div style="min-width:0">
+          <strong style="font-size:15px">🔔 ศูนย์แจ้งเตือน &amp; LINE Quota</strong>
+          <div class="muted" style="font-size:11px">แจ้งเตือนระหว่างวัน + สรุปปิดตลาด EOD 17:05 เข้า MiniApp ฟรี (ไม่ใช้โควต้า LINE)</div>
+        </div>
+        <div class="inbox-head-actions">
+          <button id="inbox-mark-all-btn" class="icon-btn inbox-icon-btn" type="button" title="อ่านทั้งหมด" aria-label="อ่านทั้งหมด">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/></svg>
+          </button>
+          <button id="inbox-export-btn" class="icon-btn inbox-icon-btn" type="button" title="สำรอง/ดาวน์โหลด JSON" aria-label="สำรองข้อมูล JSON">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
+          <button id="inbox-clear-btn" class="icon-btn inbox-icon-btn inbox-icon-danger" type="button" title="สำรองและล้างประวัติแจ้งเตือน" aria-label="ล้างประวัติแจ้งเตือน">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+          </button>
+          <button id="inbox-close-btn" class="icon-btn inbox-icon-btn" type="button" title="ปิด" aria-label="ปิด">✕</button>
+        </div>
+      </div>
+      <div id="inbox-quota-summary" class="inbox-quota-box"></div>
+      <div class="chip-row inbox-filter-row" id="inbox-filters">
+        <button class="chip-btn pill-sky" data-ifilter="all" type="button">ทั้งหมด</button>
+        <button class="chip-btn" data-ifilter="otp" type="button">OTP</button>
+        <button class="chip-btn" data-ifilter="trade" type="button">Trade/Nego</button>
+        <button class="chip-btn" data-ifilter="eod" type="button">EOD/ระบบ</button>
+      </div>
+      <div id="inbox-list" class="inbox-list"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/miniapp/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[Unit]
+Description=Investment Homelab FastAPI Gateway (:8000 — Zero-DB Pure CDP & LINE Webhook)
+After=network-online.target graphical-session.target
+Wants=network-online.target graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+UnsetEnvironment=LINE_ADMIN_USER_ID
+ExecStart=/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+KillMode=process
+StandardOutput=append:/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/data/logs/gateway.out
+StandardError=append:/home/araya-sawasdichai/Documents/antigravity/InvestmentHomelab/data/logs/gateway.out
+
+[Install]
+WantedBy=default.target
